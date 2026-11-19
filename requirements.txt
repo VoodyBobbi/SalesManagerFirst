@@ -1,0 +1,47 @@
+# Единственный список зависимостей проекта для Windows x64 / Python 3.12.
+# Включает приложение, тесты и сборку с точными версиями проверенного окружения.
+# Обычному пользователю готового EXE устанавливать эти пакеты не нужно.
+
+# Прямые зависимости приложения
+PySide6==6.10.1
+httpx==0.28.1
+beautifulsoup4==4.14.2
+keyring==25.7.0
+certifi==2025.11.12
+truststore==0.10.4
+pymorphy3==2.0.6
+pymorphy3-dicts-ru==2.4.417150.4580142
+dawg2-python==0.9.0
+
+# Тестирование и сборка (PyInstaller — основной способ, Nuitka — дополнительный)
+pytest==9.0.1
+pytest-qt==4.5.0
+pyinstaller==6.17.0
+pyinstaller-hooks-contrib==2026.10
+Nuitka==2.8.9
+ordered-set==4.1.0
+zstandard==0.25.0
+
+# Зависимости перечисленных выше библиотек и инструментов
+altgraph==0.17.5
+anyio==4.16.0
+colorama==0.4.6
+h11==0.16.0
+httpcore==1.0.9
+idna==3.20
+iniconfig==2.3.1
+jaraco.classes==3.4.0
+jaraco.context==6.1.2
+jaraco.functools==4.6.0
+more-itertools==11.2.1
+packaging==26.3
+pefile==2024.8.26
+pluggy==1.7.0
+Pygments==2.21.0
+PySide6_Addons==6.10.1
+PySide6_Essentials==6.10.1
+pywin32-ctypes==0.2.3
+setuptools==84.2.1
+shiboken6==6.10.1
+soupsieve==4.1
+typing_extensions==4.16.0
