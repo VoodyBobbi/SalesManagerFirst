@@ -234,6 +234,8 @@ def test_invalid_setting_recovery_does_not_commit_callers_transaction(tmp_path):
 
 
 def test_startup_recovers_corrupt_legacy_marker_without_losing_settings(tmp_path):
+    from sales_manager.storage.migrations import MIGRATIONS
+
     path = tmp_path / 'settings.sqlite3'
     store = Store(path)
     store.set_setting('sender.name', 'Сохранённая компания')
@@ -244,6 +246,6 @@ def test_startup_recovers_corrupt_legacy_marker_without_losing_settings(tmp_path
         assert reopened.get_setting('sender.name') == 'Сохранённая компания'
         event = reopened.one("SELECT details FROM audit_events WHERE event='settings.invalid_json'")
         assert json.loads(event['details']) == {'key': 'fit.relationship_reviewed_v5', 'value': '{broken'}
-        assert reopened.one('PRAGMA user_version')['user_version'] == 6
+        assert reopened.one('PRAGMA user_version')['user_version'] == max(MIGRATIONS)
     finally:
         reopened.close()

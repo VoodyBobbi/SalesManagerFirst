@@ -11,7 +11,7 @@ from sales_manager.research.providers import SearchResult
 from sales_manager.research.safe_http import FetchError
 from sales_manager.research.service import ResearchService
 from sales_manager.storage import Store, now
-from sales_manager.storage.migrations import SCHEMA
+from sales_manager.storage.migrations import MIGRATIONS, SCHEMA
 
 
 @pytest.fixture
@@ -302,7 +302,7 @@ def test_old_schema_records_survive_and_legacy_score_is_not_a_measurement(tmp_pa
     connection.commit()
     connection.close()
     store = Store(path)
-    assert store.one('PRAGMA user_version')['user_version'] == 6
+    assert store.one('PRAGMA user_version')['user_version'] == max(MIGRATIONS)
     assert store.one('SELECT name FROM products')['name'] == 'кофе'
     assert store.one('SELECT score FROM market_signals')['score'] == 999
     assert store.query('SELECT * FROM market_observations') == []
@@ -404,6 +404,21 @@ def test_unknown_or_future_publication_and_future_period_are_not_current(service
     assert market_ranking(service.store, ['Россия'], as_of=datetime(2026, 11, 13, tzinfo=timezone.utc))['rows'] == []
 
 
+@pytest.mark.parametrize(('end_year', 'published', 'evaluation_year', 'expected_periods'), [
+    (2030, '2026-11-01', 2026, []),
+    (2030, '2026-11-01', 2031, []),
+    (2030, '', 2026, []),
+    (2026, '2026-11-01', 2026, ['2025/2026']),
+    (2030, '', 2031, ['2025/2030']),
+])
+def test_multi_year_measurement_respects_year_of_publication_or_evaluation(
+        service, end_year, published, evaluation_year, expected_periods):
+    ingest(service, f'В России за 2025–{end_year} годы продажи кофе выросли на 12%.', published=published)
+    as_of = datetime(evaluation_year, 11, 20, tzinfo=timezone.utc)
+    ranking = market_ranking(service.store, ['Россия'], as_of=as_of)
+    assert [row['measurements'][0]['period'] for row in ranking['rows']] == expected_periods
+
+
 def test_query_country_does_not_assign_public_demand_to_wrong_market(service):
     ingest(service, 'В Казахстане в 2026 году спрос на кофе растёт.', country='Россия')
     assert service.store.one('SELECT country FROM market_observations')['country'] == 'Казахстан'
@@ -451,7 +466,7 @@ def test_measurement_source_migration_preserves_original_evidence(tmp_path):
     connection.commit()
     connection.close()
     store = Store(path)
-    assert store.one('PRAGMA user_version')['user_version'] == 6
+    assert store.one('PRAGMA user_version')['user_version'] == max(MIGRATIONS)
     assert store.one('SELECT value FROM market_observations')['value'] == 500
     assert store.one('SELECT * FROM market_observation_sources') == {
         'observation_id': 1, 'source_id': 1, 'excerpt': 'Старое свидетельство', 'published_at': ''}

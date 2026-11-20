@@ -17,6 +17,8 @@ from html.parser import HTMLParser
 from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
 USER_AGENT = 'SalesManagerFirst/1.0 (public business research; robots respected)'
+_DNS_SLOTS = threading.BoundedSemaphore(4)
+_ROBOTS_BACKOFF = 45
 
 class FetchError(RuntimeError):
     pass
@@ -135,6 +137,40 @@ def public_addresses(host, port):
             raise FetchError('Приватный IPv4-адрес запрещён.')
     return addresses
 
+
+def _bounded_dns(host, port, deadline, check_cancel):
+    # The OS may block in getaddrinfo. Timed-out calls retain their slot until
+    # they actually exit, so repeated attempts cannot accumulate threads.
+    if not _DNS_SLOTS.acquire(blocking=False):
+        raise FetchError('Служба DNS занята; используем другие источники.')
+    finished = threading.Event()
+    result = []
+
+    def resolve():
+        try:
+            result.append(public_addresses(host, port))
+        except Exception as exc:
+            result.append(exc)
+        finally:
+            _DNS_SLOTS.release()
+            finished.set()
+
+    try:
+        threading.Thread(target=resolve, name='market-dns', daemon=True).start()
+    except RuntimeError:
+        _DNS_SLOTS.release()
+        raise FetchError('Не удалось запустить проверку DNS.') from None
+    while True:
+        check_cancel()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise FetchError('Превышено время определения адреса DNS.')
+        if finished.wait(min(.1, remaining)):
+            check_cancel()
+            if isinstance(result[0], Exception):
+                raise result[0]
+            return result[0]
+
 class _PinnedHTTPS(http.client.HTTPSConnection):
     def __init__(self, host, port, address, timeout):
         try:
@@ -213,6 +249,7 @@ class SafeFetcher:
         self.cancel_check = cancel_check
         self._robots = {}
         self._robots_checked_at = {}
+        self._robots_retry_at = {}
         self._last_request = {}
         self._robots_locks = {}
 
@@ -237,7 +274,7 @@ class SafeFetcher:
         parsed = urlsplit(validate_url(url))
         port = parsed.port or (443 if parsed.scheme == 'https' else 80)
         deadline = time.monotonic() + (self.timeout if timeout is None else timeout)
-        addresses = public_addresses(parsed.hostname, port)
+        addresses = _bounded_dns(parsed.hostname, port, deadline, self._check_cancel)
         conn = None
         error = None
         for address in addresses[:3]:
@@ -318,7 +355,8 @@ class SafeFetcher:
 
     def _check_robots(self, url):
         parsed = urlsplit(url)
-        origin = f'{parsed.scheme}://{parsed.netloc}'
+        default_port = 443 if parsed.scheme == 'https' else 80
+        origin = f'{parsed.scheme}://{parsed.netloc.removesuffix(f":{default_port}")}'
         # Independent hosts may redirect to one origin during a parallel batch.
         # Reserve its next permitted request atomically, including robots load.
         lock = self._robots_locks.setdefault(origin, threading.RLock())
@@ -332,10 +370,17 @@ class SafeFetcher:
             lock.release()
 
     def _check_robots_locked(self, url, origin):
-        if origin not in self._robots or time.monotonic() - self._robots_checked_at.get(origin, 0) >= 86400:
+        timestamp = time.monotonic()
+        if timestamp < self._robots_retry_at.get(origin, 0):
+            raise FetchError('robots.txt временно недоступен. Повторите позже.')
+        self._robots_retry_at.pop(origin, None)
+        if origin not in self._robots or timestamp - self._robots_checked_at.get(origin, 0) >= 86400:
             result = self._raw(origin + '/robots.txt', 500 * 1024, truncate=True)
-            if result.status in (401, 403, 429) or result.status >= 500:
-                raise FetchError('Ограничение robots.txt или временный отказ сайта.')
+            if result.status == 429 or 500 <= result.status < 600:
+                self._robots_retry_at[origin] = time.monotonic() + _ROBOTS_BACKOFF
+                raise FetchError('robots.txt временно недоступен. Повторите позже.')
+            if result.status in (401, 403):
+                raise FetchError('Сайт ограничил доступ к robots.txt.')
             robot = RobotsRules(result.text.splitlines() if result.status == 200 else [])
             self._robots[origin] = robot
             self._robots_checked_at[origin] = time.monotonic()

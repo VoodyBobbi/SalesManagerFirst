@@ -19,13 +19,13 @@ from .providers import (ExaProvider, FirecrawlProvider, GDELTProvider, OverpassP
                         ProviderError, QuotaError, SearchResult, TransientProviderError, WikidataProvider, json_http,
                         TavilyProvider, SerperProvider, JinaProvider, MediaWikiProvider, RSSProvider,
                         KEYED_PROVIDERS, NoSourcesError, MissingKeyError, PublicPagesProvider,
-                        ComtradeProvider, RateLimitError)
+                        ComtradeProvider, OVERPASS_HOSTS, RateLimitError)
 from .safe_http import FetchError, SafeFetcher, validate_url
 from .quota import fetch_quota
 from .registry import ADAPTERS, market_source_names
 from .reporting import market_summary
 from .access import credential_hash, verify_free_access, free_access_valid
-from .market import (MARKET_PERIOD_QUERY, article_text, extract_observations, market_publication_possible,
+from .market import (article_text, extract_observations, market_publication_possible,
                      market_ranking, measurement_basis, current_market_fact, market_fact_clause, SENTENCE_BOUNDARY)
 from sales_manager.core.company_listing import visible_companies
 
@@ -70,6 +70,7 @@ class ResearchService:
         self._requests = 0
         self._limit = 100
         self._provider_clock = {}
+        self._provider_locks = {}
         self._force_refresh = False
         self._responded = set()
         self._unavailable = set()
@@ -165,28 +166,38 @@ class ResearchService:
             return cached
         self._checkpoint()
         host = urlsplit(url).hostname
-        interval = {'api.firecrawl.dev': 6.1, 'maps.mail.ru': 2.0,
+        interval = 2.0 if host in OVERPASS_HOSTS else {'api.firecrawl.dev': 6.1,
                     'api.gdeltproject.org': 5.1, 'www.wikidata.org': 1.0,
                     'comtradeapi.un.org': 1.1}.get(host, .3)
-        wait = interval - (time.monotonic() - self._provider_clock.get(host, 0))
-        if wait > 0 and self._cancel.wait(wait):
-            raise Paused('Исследование приостановлено.')
-        self._take_request()
-        self._provider_clock[host] = time.monotonic()
-        provider = {'api.exa.ai': 'exa', 'api.firecrawl.dev': 'firecrawl', 'api.tavily.com': 'tavily',
-                    'google.serper.dev': 'serper', 's.jina.ai': 'jina', 'maps.mail.ru': 'overpass',
+        provider = 'overpass' if host in OVERPASS_HOSTS else {
+                    'api.exa.ai': 'exa', 'api.firecrawl.dev': 'firecrawl', 'api.tavily.com': 'tavily',
+                    'google.serper.dev': 'serper', 's.jina.ai': 'jina',
                     'api.gdeltproject.org': 'gdelt', 'www.wikidata.org': 'wikidata',
                     'ru.wikipedia.org': 'mediawiki', 'comtradeapi.un.org': 'comtrade'}.get(host, host)
-        # Count real attempts, including failed requests; never infer provider balance.
-        self.store.execute('INSERT INTO usage_log(provider,operation,credits,created_at) VALUES(?,?,?,?)',
-                           (provider, 'research_request', 0, now()))
+        with self._request_lock:
+            host_lock = self._provider_locks.setdefault(host, threading.Lock())
+        while True:
+            with host_lock:
+                timestamp = time.monotonic()
+                wait = self._provider_clock.get(host, timestamp - interval) + interval - timestamp
+                if wait <= 0:
+                    self._take_request()
+                    # Record the attempt before releasing its request slot, so
+                    # a slow write cannot push it into the next slot.
+                    usage_id = self.store.execute(
+                        'INSERT INTO usage_log(provider,operation,credits,created_at) VALUES(?,?,?,?)',
+                        (provider, 'research_request', 0, now()))
+                    self._provider_clock[host] = time.monotonic()
+                    break
+            if self._cancel.wait(wait):
+                raise Paused('Исследование приостановлено.')
         result = json_http(method, url, **kwargs)
         self._put_cache(key, result)
         credits = (result.get('costDollars') or {}).get('total', 0)
         if not isinstance(credits, (int, float)):
             credits = 0
         if credits:
-            self.store.execute('UPDATE usage_log SET credits=? WHERE id=(SELECT MAX(id) FROM usage_log WHERE provider=?)', (credits, provider))
+            self.store.execute('UPDATE usage_log SET credits=? WHERE id=?', (credits, usage_id))
         return result
 
     def _providers(self):
@@ -362,8 +373,10 @@ class ResearchService:
         return 'Режим поиска: расширенный' if extended else 'Режим поиска: базовый — без API-ключей'
 
     def _search(self, name, provider, query, country, limit=10, force=False):
+        if name == 'gdelt' and hasattr(provider, 'topic_for') and not provider.topic_for(query):
+            return []
         cache_country = '' if name == 'gdelt' else country
-        key = _key('search:v1:', [name, clean_text(query), cache_country, limit,
+        key = _key('search:v2:' if name == 'gdelt' else 'search:v1:', [name, clean_text(query), cache_country, limit,
                    hashlib.sha256(self.secrets.get(name + '_key').encode()).hexdigest()])
         cached = None if force or self._force_refresh else self._cache(key)
         if cached is not None:
@@ -509,7 +522,7 @@ class ResearchService:
                     geography = ('(' + ' OR '.join('"' + item + '"' for item in countries) + ')'
                                  if name == 'tavily' else country)
                     query = (f'{category} спрос новости' if name == 'gdelt' else
-                             f'{category} {" ".join(goods[:2])} продажи спрос статистика {geography} {MARKET_PERIOD_QUERY}')
+                             f'{category} {" ".join(goods[:2])} продажи спрос статистика {geography}')
                     tasks.append({'phase': 'search', 'provider': name, 'query': query,
                                   'country': '' if name in ('gdelt', 'tavily') else country, 'market': True,
                                   'selected_countries': countries})
@@ -598,7 +611,7 @@ class ResearchService:
                     geography = ('(' + ' OR '.join('"' + item + '"' for item in countries) + ')'
                                  if source == 'tavily' else country)
                     self._enqueue(run_id, {'phase': 'search', 'provider': source,
-                        'query': f'{" ".join(missing[:2])} рост спроса продажи исследование {geography} {MARKET_PERIOD_QUERY}',
+                        'query': f'{" ".join(missing[:2])} рост спроса продажи исследование {geography}',
                         'country': '' if source == 'tavily' else country, 'market': True, 'followup': True,
                         'selected_countries': countries})
                     added = True
@@ -756,7 +769,7 @@ class ResearchService:
                         'sources_used': len(self._responded), 'sources_total': total,
                         'billing_blocked_sources': self.billing_blocked_sources()}
             if kind == 'market':
-                response.update(market_summary(self.store, run_id, countries, status))
+                response.update(market_summary(self.store, run_id, countries, status, count=count))
                 self.store.execute('UPDATE job_runs SET status=?,message=? WHERE id=?',
                                    (response['status'], response['message'], run_id))
             return response
@@ -795,6 +808,9 @@ class ResearchService:
 
     def _handle(self, run_id, product_id, task, providers, emit, blocked=None):
         if task['phase'] == 'search':
+            if task.get('market'):
+                # Older persisted plans included the retired fixed date filter.
+                task['query'] = task['query'].removesuffix(' (2025 OR 2026)')
             blocked = blocked if blocked is not None else set()
             if task['provider'] == 'web':
                 route = task.get('route', self._web_route(providers))
@@ -1300,11 +1316,15 @@ class ResearchService:
                         db.execute('INSERT INTO audit_events(event,details,created_at) VALUES(?,?,?)',
                                    ('contact_retired', json.dumps(dict(old), ensure_ascii=False), now()))
                         db.execute('DELETE FROM company_contacts WHERE id=?', (old['id'],))
-        if not manual_decision and status == 'INSUFFICIENT_EVIDENCE' and potential and contacts and profile.get('activities') and self.secrets.get('gigachat_key'):
+        if (not manual_decision and status == 'INSUFFICIENT_EVIDENCE' and potential and contacts
+                and profile.get('activities') and self.store.get_setting('ai.auto_assess', True)
+                and self.secrets.get('gigachat_key')):
             if not getattr(self, 'ai', None):
                 from sales_manager.ai import AIService
                 self.ai = AIService(self.store, self.secrets)
+            self._check_cancelled()
             try:
+                emit('GigaChat оценивает применимость товара · расход токенов учитывается.')
                 self.ai.assess_fit(product_id, company_id)
                 revised = self.store.one('SELECT status,reason FROM company_fit WHERE product_id=? AND company_id=?', (product_id, company_id))
                 status, reason = revised['status'], revised['reason']

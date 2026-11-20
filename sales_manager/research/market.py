@@ -50,9 +50,7 @@ GENERAL_ARTICLE = re.compile(r'\?|календар\w*\s+спрос|как(?:ую
 COMPARISON_BASELINE = re.compile(r'\b(?:годом\s+ранее|годом\s+раньше|'
                                  r'год\s+назад|в\s+прошлом\s+году|за\s+аналогичн\w*\s+период\w*\s+прошл\w*)\b', re.I)
 MARKET_START = date(2025, 1, 1)
-MARKET_END = date(2026, 12, 31)
-MARKET_PERIOD_LABEL = f'{MARKET_START.year}–{MARKET_END.year}'
-MARKET_PERIOD_QUERY = f'({MARKET_START.year} OR {MARKET_END.year})'
+MARKET_PERIOD_LABEL = f'с {MARKET_START.year} года по настоящее время'
 NUMBER = re.compile(r'(?<![\w])\d+(?:[ \u00a0\u202f]\d{3})*(?:[.,]\d+)?')
 YEAR_RANGE = re.compile(r'\b(20\d{2})\s*(?:[-–—]|\s+(?:до|по)\s+)\s*(20\d{2})\b', re.I)
 SCALE_UNIT = re.compile(r'^\s*(?P<scale>тыс\.?|млн\.?|миллион\w*|млрд\.?|миллиард\w*)?\s*'
@@ -509,17 +507,16 @@ def _current_fact(item, as_of):
     if not market_publication_possible(published, as_of):
         return False
     stamp = _stamp(published)
-    latest = min(as_of.date(), MARKET_END, stamp.date() if stamp else MARKET_END)
+    latest = stamp.date() if stamp else as_of.date()
     period = item.get('period') or ''
     if not period:
-        return stamp is not None and stamp.date() <= latest
+        return stamp is not None
     bounds = _period_bounds(period)
     if not bounds:
         return False
     first, last = bounds
-    # The interval must have started by as_of and stay inside 2025–2026.
-    # An unfinished current month/year remains visible as a partial fact.
-    return MARKET_START <= first <= latest and last <= MARKET_END
+    # A started period may be partial within the publication or assessment year.
+    return MARKET_START <= first <= latest and last.year <= latest.year
 
 
 def _number_belongs(product, sentence, number, offset, length):
@@ -793,7 +790,7 @@ def extract_observations(product, text, country='', published_at='', metadata=No
 
 
 def _format_number(value):
-    return f'{value:,.6f}'.rstrip('0').rstrip('.').replace(',', ' ')
+    return f'{value:,.6f}'.rstrip('0').rstrip('.').replace(',', ' ').replace('.', ',')
 
 
 def measurement_basis(item):
@@ -814,7 +811,14 @@ DEMAND_METRICS = {'sales', 'purchases', 'orders', 'searches',
                   'sales_growth', 'purchases_growth', 'orders_growth', 'searches_growth'}
 
 
-def _validated_excerpt(item, as_of, parsed_cache):
+@lru_cache(maxsize=2048)
+def _parsed_market_text(product, content, country, published_at):
+    # Source text is part of the key, so edited sources are revalidated.
+    # Extraction rules are fixed for the lifetime of this in-memory cache.
+    return extract_observations(product, content, country, published_at)
+
+
+def _validated_excerpt(item, as_of):
     excerpt = item.get('excerpt') or ''
     if not usable_market_excerpt(excerpt) or not _has_product(item['name'], excerpt) or not _current_fact(item, as_of):
         return ''
@@ -831,14 +835,11 @@ def _validated_excerpt(item, as_of, parsed_cache):
     # A source can supply preceding context, but it cannot substitute a separate claim.
     source = item.get('text') or ''
     saved = clean_text(excerpt).strip(' .!?')
-    scopes = [('excerpt', excerpt)]
+    scopes = [excerpt]
     if source and source != excerpt:
-        scopes.append(('source', source))
-    for scope, content in scopes:
-        key = (scope, item['name'], item.get('source_id'), content if scope == 'excerpt' else '')
-        if key not in parsed_cache:
-            parsed_cache[key] = extract_observations(item['name'], content, item['country'], item.get('published_at') or '')
-        for row in parsed_cache[key]:
+        scopes.append(source)
+    for content in scopes:
+        for row in _parsed_market_text(item['name'], content, item['country'], item.get('published_at') or ''):
             if (row['metric'] == item['metric'] and row['unit'] == unit
                     and row['country'] == item['country'] and row['period'] == item['period']
                     and (public or (row['value'] is not None and math.isclose(row['value'], value, rel_tol=1e-12)))):
@@ -864,10 +865,9 @@ def _accepted_facts(store, countries, as_of):
         JOIN sources s ON s.id=COALESCE(l.source_id,o.source_id)
         WHERE o.country IN (''' + placeholders + ''')
         ORDER BY o.published_at DESC,o.created_at DESC,o.id DESC''', tuple(countries))
-    parsed_cache = {}
     output = []
     for item in observations:
-        excerpt = _validated_excerpt(item, as_of, parsed_cache)
+        excerpt = _validated_excerpt(item, as_of)
         if excerpt:
             output.append({**item, 'excerpt': excerpt})
     # Recheck legacy records from their saved text, without changing or deleting history.
@@ -883,10 +883,10 @@ def _accepted_facts(store, countries, as_of):
         ORDER BY ms.created_at DESC,ms.id DESC''', tuple(countries))
     for source in legacy:
         text = source['text'] or source['description'] or source['title'] or ''
-        for extracted in extract_observations(source['name'], text, source['country'], source['published_at']):
+        for extracted in _parsed_market_text(source['name'], text, source['country'], source['published_at']):
             item = {**source, **extracted, 'observation_id': None}
             if item['country'] in countries:
-                excerpt = _validated_excerpt(item, as_of, parsed_cache)
+                excerpt = _validated_excerpt(item, as_of)
                 if excerpt:
                     output.append({**item, 'excerpt': excerpt})
     # Re-evaluate legacy identities without deleting any source link.
@@ -1035,4 +1035,8 @@ def market_ranking(store, countries, limit=10, as_of=None):
     preliminary = any(row['demand_percent'] is None for row in result) or not result
     caption = ('Предварительный рейтинг по публичным признакам спроса: независимые публикации и их свежесть' if preliminary else
                'Измеренные показатели: сравнение внутри одинаковых периодов и единиц')
-    return {'rows': result, 'caption': caption, 'preliminary': preliminary}
+    ranked_ids = {row['id'] for row in result}
+    publication_days = (_stamp(item['published_at'] or '') for item in facts if item['product_id'] in ranked_ids)
+    newest = max((stamp.date() for stamp in publication_days if stamp), default=None)
+    return {'rows': result, 'caption': caption, 'preliminary': preliminary,
+            'latest_publication': newest.isoformat() if newest else None}

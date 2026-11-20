@@ -1,0 +1,68 @@
+name: Windows build and release
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          architecture: x64
+          cache: pip
+      - run: python -m pip install -r requirements.txt
+      - name: Test
+        run: |
+          New-Item -ItemType Directory -Path build -Force | Out-Null
+          python -m pytest --basetemp build/pytest-temp
+      - name: Build EXE
+        run: |
+          $interpreter = (Get-Command python -CommandType Application | Select-Object -First 1).Source
+          ./packaging/build.ps1 -Python $interpreter
+      - name: Verify EXE
+        run: ./packaging/verify-exe.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SalesManagerFirst-Windows-x64
+          if-no-files-found: error
+          path: |
+            dist/SalesManagerFirst.exe
+            dist/SHA256SUMS.txt
+            dist/release-info.json
+
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: SalesManagerFirst-Windows-x64
+          path: dist
+      - name: Publish verified build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $info = Get-Content dist/release-info.json -Raw | ConvertFrom-Json
+          if ($env:GITHUB_REF_NAME -cne "v$($info.version)") { throw 'Tag does not match the EXE version.' }
+          $hash = (Get-FileHash dist/SalesManagerFirst.exe -Algorithm SHA256).Hash
+          $checksum = (Get-Content dist/SHA256SUMS.txt -Raw).Trim()
+          if ($hash -cne $info.exe_sha256 -or $checksum -cne "$hash  SalesManagerFirst.exe") { throw 'Release checksum mismatch.' }
+          gh release create $env:GITHUB_REF_NAME --verify-tag --generate-notes dist/SalesManagerFirst.exe dist/SHA256SUMS.txt dist/release-info.json

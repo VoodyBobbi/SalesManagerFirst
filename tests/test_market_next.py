@@ -95,6 +95,46 @@ def test_gdelt_uses_translated_search_without_claiming_publisher_is_market():
     assert result[0].country == 'Россия'  # Search context only; extraction still validates the article.
 
 
+def test_gdelt_does_not_call_english_index_with_untranslated_words():
+    request = Mock(return_value={'articles': []})
+    source = GDELTProvider(request)
+    assert source.search('клапан обратного давления', 'Россия') == []
+    request.assert_not_called()
+    source.search('рынок кофе Россия', 'Россия')
+    assert 'coffee' in request.call_args.kwargs['params']['query']
+
+
+def test_resumed_market_plan_drops_the_old_year_filter(tmp_path, monkeypatch):
+    from sales_manager.research.service import ResearchService
+    from sales_manager.storage import Store
+
+    store = Store(tmp_path / 'market.sqlite')
+    try:
+        service = ResearchService(store, Mock())
+        search = Mock(return_value=[])
+        monkeypatch.setattr(service, '_search', search)
+        provider = Mock()
+        task = {'phase': 'search', 'market': True, 'provider': 'tavily',
+                'query': 'спрос на кофе (2025 OR 2026)', 'country': 'Россия'}
+        service._handle(1, None, task, {'tavily': provider}, lambda message: None)
+        search.assert_called_once_with('tavily', provider, 'спрос на кофе', 'Россия', limit=10)
+    finally:
+        store.close()
+
+
+def test_rss_extracts_product_candidates_once_per_entry(monkeypatch):
+    from sales_manager.research import normalization
+    from sales_manager.research.providers import SearchResult
+
+    extract = Mock(wraps=normalization.product_candidates)
+    monkeypatch.setattr(normalization, 'product_candidates', extract)
+    source = RSSProvider(Mock())
+    entry = SearchResult('https://news.example/paper', 'Бумага', 'растёт спрос')
+    monkeypatch.setattr(source, 'discover', lambda *args, **kwargs: [entry])
+    source.search('канцелярия и офис', 'Россия')
+    assert [call.args for call in extract.call_args_list].count(('бумага растёт спрос',)) == 1
+
+
 @pytest.mark.parametrize('text', [
     'В России покупатели чаще покупали кофе.',
     'В России смартфоны стали самыми популярными товарами.',

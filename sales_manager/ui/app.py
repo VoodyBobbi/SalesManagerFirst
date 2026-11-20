@@ -4,7 +4,9 @@ import os
 import re
 import sys
 import threading
+import time
 import uuid
+from datetime import date
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QLockFile, QSize, QThreadPool, QTimer
@@ -20,21 +22,23 @@ from shiboken6 import isValid
 from sales_manager import __version__
 from sales_manager.ai import AIService
 from sales_manager.mail import MailService
+from sales_manager.mail.service import daily_limit
 from sales_manager.research import COUNTRIES, ResearchService, normalize_product
-from sales_manager.research.market import import_statistics, market_evidence, market_ranking
-from sales_manager.research.providers import RSSProvider
+from sales_manager.research.market import MARKET_PERIOD_LABEL, import_statistics, market_evidence, market_ranking
+from sales_manager.research.providers import RSSProvider, close_provider_http
 from sales_manager.research.reporting import market_summary
 from sales_manager.storage import Secrets, Store, now
 from sales_manager.storage.settings_save import apply_settings, validate_extra_urls
-from sales_manager.core.contacts import company_emails
 from sales_manager.core.company_listing import visible_companies
-from .dialogs import CompanyDialog, CountriesDialog, HistoryDialog, OfferDialog, SourcesDialog, label, open_site
+from sales_manager.core.diagnostics import configure_diagnostics, humanize_error, log_exception
+from .dialogs import CompanyDialog, CountriesDialog, HistoryDialog, OfferDialog, SourcesDialog, confirm, label, open_site
 from .theme import COLORS, STYLE, DemandDelegate, demand_background, enable_row_hover, font as theme_font, notice_tone, palette as theme_palette
 from .workers import Worker
 from .busy import BusyOverlay
 
 
 KEYED_SOURCES = {'tavily': 'Tavily', 'serper': 'Serper', 'exa': 'Exa', 'firecrawl': 'Firecrawl', 'jina': 'Jina Search'}
+UNVERIFIABLE_KEYS = {'serper', 'exa', 'jina'}
 KEYLESS_SOURCES = {'overpass': 'OpenStreetMap / Overpass', 'gdelt': 'GDELT', 'wikidata': 'Wikidata', 'mediawiki': 'Wikipedia', 'rss': 'RSS', 'comtrade': 'UN Comtrade · статистика торговли', 'catalog': 'Открытые каталоги', 'procurement': 'Публикации закупок'}
 
 
@@ -127,9 +131,15 @@ class Window(QMainWindow):
         self.workers = set()
         self.research_cancel = None
         self.research_kind = None
+        self.market_rows = []
+        self._market_request = 0
+        self._market_loaded_countries = None
+        self._market_loading = False
         self.mail_busy = False
+        self.mail_cancel = threading.Event()
         self.search_check_busy = False
         self._closing = False
+        self._close_started = None
         self.product_id = None
         self.company_rows = []
         self.countries = self.store.get_setting('research.countries', list(COUNTRIES))
@@ -160,6 +170,9 @@ class Window(QMainWindow):
         self.action_notice = label('')
         self.action_notice.setObjectName('notice')
         action_layout.addWidget(self.action_notice, 1)
+        self.force_close_button = button('Закрыть принудительно', self.force_close)
+        self.force_close_button.hide()
+        action_layout.addWidget(self.force_close_button)
         layout.insertWidget(1, self.action_row)
         self.action_row.hide()
         self.busy_indicator = QProgressBar()
@@ -175,7 +188,7 @@ class Window(QMainWindow):
         self.busy_overlay = BusyOverlay(self)
         self._foreground_worker = None
         self._recovery_attempted = set()
-        self._auto_recovery_enabled = True
+        self._auto_recovery_enabled = self.store.get_setting('research.auto_recovery', True)
         self.refresh_branches()
         self.refresh_market()
         self.refresh_companies()
@@ -193,17 +206,20 @@ class Window(QMainWindow):
         self.close_timer.timeout.connect(self._finish_close)
         self.startup_mail_timer = QTimer(self)
         self.startup_mail_timer.setSingleShot(True)
-        self.startup_mail_timer.timeout.connect(self.sync_mail)
+        self.startup_mail_timer.timeout.connect(self.sync_startup_mail)
         self.startup_mail_timer.start(800)
         self.recovery_timer = QTimer(self)
         self.recovery_timer.setSingleShot(True)
         self.recovery_timer.timeout.connect(self.recover_research)
-        self.recovery_timer.start(400)
+        if self._auto_recovery_enabled:
+            self.recovery_timer.start(400)
 
-    def submit(self, function, success=None, owner=None, failed=None, finished=None, busy_message=None, silent=False, cancel=None):
+    def submit(self, function, success=None, owner=None, failed=None, finished=None, busy_message=None, silent=False,
+               cancel=None, *, context=None, run_id=None, company_id=None):
         if busy_message and self._foreground_worker is not None:
             return None
-        worker = Worker(function, cleanup=self.store.close)
+        worker = Worker(function, cleanup=self.store.close, context=context or busy_message or 'Фоновая операция',
+                        run_id=run_id, company_id=company_id)
         self.workers.add(worker)
         owner = owner or self
         if busy_message:
@@ -247,6 +263,8 @@ class Window(QMainWindow):
                 return
             if not self.workers and isValid(self.busy_indicator):
                 self.busy_indicator.hide()
+            if hasattr(self, 'ai_status') and not self._closing:
+                self.update_ai_budget()
             if finished:
                 finished()
         worker.signals.succeeded.connect(completed)
@@ -261,7 +279,8 @@ class Window(QMainWindow):
         """Only business stages reach the card; provider details stay in diagnostics."""
         text = str(message).casefold()
         if any(word in text for word in ('gigachat', 'смыслов')):
-            return 'GigaChat анализирует найденные сведения'
+            return ('GigaChat оценивает применимость · расход токенов учитывается'
+                    if 'токенов' in text else 'GigaChat анализирует найденные сведения')
         if any(word in text for word in ('контакт', 'изучаем сайт', 'обрабатываем страниц')):
             return 'Изучаем сайты и собираем контакты'
         return default
@@ -362,14 +381,45 @@ class Window(QMainWindow):
             self.restore_research_notices()
 
     def refresh_market(self):
-        ranking = market_ranking(self.store, self.countries)
+        if self._closing:
+            return
+        if self._market_loaded_countries != tuple(self.countries):
+            self._market_loaded_countries = None
+            self.market_rows = []
+            self.market_table.setRowCount(0)
+            self.market_hint.setText('Загружаем рейтинг по выбранным странам…')
+            self.market_hint.setToolTip('')
+        self._market_request += 1
+        if not self._market_loading:
+            self._load_market()
+
+    def _load_market(self):
+        request = self._market_request
+        countries = tuple(self.countries)
+        self._market_loading = True
+
+        def loaded(ranking):
+            if request == self._market_request and countries == tuple(self.countries):
+                self._market_loaded_countries = countries
+                self._show_market(ranking)
+                self.restore_research_notices()
+
+        def finished():
+            self._market_loading = False
+            if not self._closing and request != self._market_request:
+                self._load_market()
+
+        self.submit(lambda emit: market_ranking(self.store, list(countries)), loaded, finished=finished)
+
+    def _show_market(self, ranking):
         self.market_rows = ranking['rows']
-        self.market_caption = ('По данным публикаций · независимые источники и свежесть · 90 дней'
+        self.market_caption = (f'По данным публикаций {MARKET_PERIOD_LABEL}'
                                if ranking['preliminary'] else
-                               'Спрос относительно лидера среди сопоставимых показателей · 90 дней')
-        if hasattr(self, 'market_hint'):
-            self.market_hint.setText(self.market_caption)
-            self.market_hint.setToolTip(ranking.get('caption', self.market_caption))
+                               f'Спрос относительно лидера среди сопоставимых показателей · {MARKET_PERIOD_LABEL}')
+        if newest := ranking.get('latest_publication'):
+            self.market_caption += f' · Последняя публикация {date.fromisoformat(newest):%d.%m.%Y}'
+        self.market_hint.setText(self.market_caption)
+        self.market_hint.setToolTip(ranking.get('caption', self.market_caption))
         for index in range(self.market_table.rowCount()):
             previous = self.market_table.cellWidget(index, 2)
             if previous is not None:
@@ -407,8 +457,9 @@ class Window(QMainWindow):
                 self.statusBar().showMessage('Выберите товар.', 6000)
                 return
             product_id = self.market_rows[row]['id']
-        sources = market_evidence(self.store, product_id, self.countries)
-        SourcesDialog(sources, self).exec()
+        countries = list(self.countries)
+        self.submit(lambda emit: market_evidence(self.store, product_id, countries),
+                    lambda sources: SourcesDialog(sources, self).exec() if countries == self.countries else None)
 
     def show_import_statistics(self):
         sources = import_statistics(self.store, self.countries)
@@ -481,6 +532,8 @@ class Window(QMainWindow):
         self.manual_company.triggered.connect(self.add_company)
         self.refresh_mail_button = more.addAction('Проверить ответы')
         self.refresh_mail_button.triggered.connect(lambda: self.sync_mail(manual=True))
+        self.review_opt_out_button = more.addAction('Проверить просьбы об отписке')
+        self.review_opt_out_button.triggered.connect(self.review_opt_outs)
         self.company_more.setMenu(more)
         row.addWidget(self.branches, 1)
         row.addWidget(self.company_start)
@@ -574,7 +627,8 @@ class Window(QMainWindow):
             company.setToolTip(row['name'] + '\n' + (row['url'] or '') + '\nДвойной щелчок по строке — карточка компании')
             self.company_table.setCellWidget(index, 0, company)
             email_item = QTableWidgetItem(row['email'] or 'Email не найден')
-            email_item.setToolTip(row['email'] or 'Email не найден')
+            email_item.setToolTip((row['email'] + '\nСлужебный адрес, отправка недоступна')
+                                  if row['email'] and not row['sendable_email'] else row['email'] or 'Email не найден')
             if not row['email']:
                 email_item.setForeground(QColor(COLORS['muted']))
             self.company_table.setItem(index, 1, email_item)
@@ -588,18 +642,23 @@ class Window(QMainWindow):
                 missing_phone = QTableWidgetItem('Телефон не найден')
                 missing_phone.setForeground(QColor(COLORS['muted']))
                 self.company_table.setItem(index, 2, missing_phone)
-            if row['sent'] or row['uncertain']:
-                status = 'Отправлено ✓' if row['sent'] else 'Проверяется'
-                item = QTableWidgetItem(status)
-                item.setForeground(QColor(COLORS['success'] if row['sent'] else COLORS['warning']))
+            if row['sent']:
+                item = QTableWidgetItem('Отправлено ✓')
+                item.setForeground(QColor(COLORS['success']))
                 self.company_table.setItem(index, 3, item)
-            elif row['email'] and row['fit_status'] == 'FIT':
+            elif row['uncertain']:
+                review = button('Проверяется', lambda checked=False, company_id=row['id']: self.preview_offer(company_id))
+                review.setObjectName('cellAction')
+                review.setToolTip('Проверить состояние отправки')
+                cell_control(self.company_table, index, 3, review)
+            elif row['sendable_email'] and row['fit_status'] == 'FIT':
                 offer = button('УТП', lambda checked=False, company_id=row['id']: self.preview_offer(company_id))
                 offer.setObjectName('cellAction')
                 offer.setToolTip('Подготовить и посмотреть письмо перед отправкой')
                 cell_control(self.company_table, index, 3, offer)
             else:
-                status = 'Нужна проверка' if row['fit_status'] == 'INSUFFICIENT_EVIDENCE' else ('Не подходит' if row['fit_status'] == 'NOT_FIT' else 'Нет email')
+                status = {'INSUFFICIENT_EVIDENCE': 'Нужна проверка', 'NOT_FIT': 'Не подходит'}.get(
+                    row['fit_status'], 'Нет email для отправки' if row['email'] else 'Нет email')
                 item = QTableWidgetItem(status)
                 if row['fit_status'] == 'INSUFFICIENT_EVIDENCE':
                     item.setForeground(QColor(COLORS['warning']))
@@ -722,7 +781,10 @@ class Window(QMainWindow):
                 return self.research.resume_companies(run_id, product_id, countries, emit, token)
             return self.research.find_companies(product_id, countries, emit, token, manual_url=manual_url)
         def failed(message):
-            self.store.audit('research.failed', str(message)[:1000])
+            try:
+                self.store.audit('research.failed', str(message)[:1000])
+            except Exception as exc:
+                log_exception('Аудит сбоя исследования', exc, run_id=run_id)
             if kind == 'market':
                 self.market_research_notice.setText('Не удалось закончить поиск. Найденные результаты сохранены.')
                 self.market_research_notice.show()
@@ -733,7 +795,7 @@ class Window(QMainWindow):
                    'Изучаем сайты и собираем контакты' if manual_url or manual_resume else
                    'Ищем компании, которым может подойти товар')
         self.submit(operation, self.research_done, finished=self.research_finished, failed=failed,
-                    busy_message=message, cancel=self.pause_research)
+                    busy_message=message, cancel=self.pause_research, run_id=run_id)
 
     def pause_research(self):
         if self.research_cancel is not None:
@@ -752,7 +814,8 @@ class Window(QMainWindow):
                 self.clear_guide()
                 message = result.get('message')
                 if result.get('run_id'):
-                    message = market_summary(self.store, result['run_id'], self.countries)['message']
+                    message = market_summary(self.store, result['run_id'], self.countries,
+                                             count=result.get('count', len(self.market_rows)))['message']
                 self.market_research_notice.setText(message or 'Исследование закончено. Результаты сохранены.')
                 self.market_research_notice.show()
                 return
@@ -768,6 +831,7 @@ class Window(QMainWindow):
             self.company_research_notice.show()
 
     def research_finished(self):
+        kind = self.research_kind
         self.research_cancel = None
         if self._closing:
             return
@@ -784,12 +848,20 @@ class Window(QMainWindow):
         self.company_pause.hide()
         self.market_start.show()
         self.company_start.show()
-        self.refresh_market()
+        if kind == 'market':
+            self.refresh_market()
         self.refresh_companies()
         self.update_resume_labels()
         self.update_search_usage()
+        self.update_ai_status()
+        self.start_maintenance()
         if self._auto_recovery_enabled and not self.recovery_timer.isActive():
             self.recovery_timer.start(100)
+
+    def start_maintenance(self, *, startup=False):
+        if not self._closing:
+            self.submit(lambda emit: self.store.retention(startup=startup), busy_message='Обслуживаем базу данных',
+                        failed=lambda message: self.statusBar().showMessage(message, 15000))
 
     def update_resume_labels(self):
         self.market_start.setText('Найти товары')
@@ -806,11 +878,13 @@ class Window(QMainWindow):
                 row = self.store.one('SELECT status,message FROM job_runs WHERE kind=? AND product_id IS ? AND countries=? ORDER BY id DESC LIMIT 1', (kind, product_id, signature))
             if kind == 'market' and row:
                 latest = self.store.one("SELECT id FROM job_runs WHERE kind='market' AND product_id IS NULL AND countries=? ORDER BY id DESC LIMIT 1", (signature,))
-                text = market_summary(self.store, latest['id'], self.countries)['message']
+                text = market_summary(self.store, latest['id'], self.countries, count=len(self.market_rows))['message']
             else:
                 if row and row['status'] in ('paused', 'failed', 'running', 'interrupted', 'complete_partial'):
                     text = ('Поиск идёт. Ищем компании, которым может подойти товар.' if self.research_cancel is not None else
-                            'Незавершённый поиск сохранён для автоматического восстановления.')
+                            'Незавершённый поиск сохранён.' + (
+                                ' Продолжится в режиме автоматического восстановления.' if self._auto_recovery_enabled else
+                                ' Нажмите «Найти компании», чтобы продолжить.'))
                 else:
                     text = ''
                 if not row and widget.text().startswith('Поиск завершён.'):
@@ -822,8 +896,8 @@ class Window(QMainWindow):
         if self._closing:
             return
         if self.research_cancel is not None:
-            self.refresh_market()
-            self.refresh_companies()
+            if self.research_kind == 'companies':
+                self.refresh_companies()
             self.restore_research_notices()
 
     def recover_research(self):
@@ -849,12 +923,14 @@ class Window(QMainWindow):
                 continue
             self.countries = countries
             self.country_button.setText(self.country_text())
+            self.refresh_market()
             if run['kind'] == 'market':
                 self.tabs.setCurrentIndex(0)
                 self.start_research('market', run_id=run['id'], recovery=True)
             elif run['product_id']:
                 self.open_product(run['product_id'])
                 self.start_research('companies', run_id=run['id'], manual_resume=run['kind'].startswith('manual:'), recovery=True)
+            self.guide('Восстанавливаем сохранённый поиск. Может использовать сеть и квоты включённых источников.')
             return
 
     def build_settings(self):
@@ -889,11 +965,18 @@ class Window(QMainWindow):
         self.ai_limit = spin(1000, 1_000_000, self.store.get_setting('ai.token_limit', 30000))
         self.ai_status = label('Не подключено')
         self.ai_status.setObjectName('muted')
+        self.ai_budget_status = label('')
+        self.ai_budget_status.setObjectName('muted')
+        self.ai_auto_assess = QCheckBox('Автоматически оценивать компании')
+        self.ai_auto_assess.setChecked(self.store.get_setting('ai.auto_assess', True))
+        self.ai_auto_assess.setToolTip('Если локальных фактов недостаточно, GigaChat может использовать токены для оценки.')
         self.ai_test = button('Проверить', self.test_ai)
         self.ai_reconcile = button('Сверить расход', self.reconcile_ai_usage)
         for title, widget in [('Ключ', self.giga_key), ('Доступ', self.ai_scope), ('Модель', self.ai_model), ('Лимит токенов', self.ai_limit)]:
             form.addRow(title, widget)
         form.addRow(self.ai_status)
+        form.addRow(self.ai_budget_status)
+        form.addRow(self.ai_auto_assess)
         form.addRow(self.ai_test)
         form.addRow(self.ai_reconcile)
         grid.addWidget(ai_group, 0, 0)
@@ -959,6 +1042,15 @@ class Window(QMainWindow):
         self.mail_status = label('Подключено' if account.get('connected') else 'Не подключено')
         self.mail_status.setObjectName('muted')
         form.addRow(self.mail_status)
+        self.mail_daily_limit = spin(1, 1000, daily_limit(self.store))
+        form.addRow('Писем в день', self.mail_daily_limit)
+        self.mail_warmup = label('Для нового ящика начните с нескольких писем в день и увеличивайте объём постепенно.')
+        self.mail_warmup.setObjectName('warningNotice')
+        self.mail_warmup.hide()
+        form.addRow(self.mail_warmup)
+        self.mail_folder = button('Выбрать папку отправленных', self.choose_sent_folder)
+        self.mail_folder.setVisible(bool(account.get('connected')))
+        form.addRow(self.mail_folder)
         row = QHBoxLayout()
         self.mail_test = button('Подключить', self.test_mail)
         self.mail_disconnect = button('Отключить', self.disconnect_mail)
@@ -1006,6 +1098,12 @@ class Window(QMainWindow):
                 key_input.setText(self.secrets.get(name + '_key'))
                 self.source_keys[name] = key_input
                 card_grid.addWidget(key_input, 0, 1)
+                if name in UNVERIFIABLE_KEYS:
+                    key_input.setReadOnly(True)
+                    key_input.setPlaceholderText('Ключ пока не используется')
+                    enabled.setEnabled(False)
+                elif name == 'firecrawl':
+                    key_input.setPlaceholderText('Оставьте пустым для доступа без ключа')
             else:
                 card_grid.addWidget(label('Регистрация не нужна'), 0, 1)
             check = button('Проверить', lambda checked=False, source=name: self.test_search(source))
@@ -1038,6 +1136,10 @@ class Window(QMainWindow):
         limits = QFormLayout()
         limits.addRow('Запросов в пакете', self.request_limit)
         limits.addRow('Страниц на компанию', self.page_limit)
+        self.auto_recovery = QCheckBox('Восстанавливать незавершённый поиск при запуске')
+        self.auto_recovery.setChecked(self.store.get_setting('research.auto_recovery', True))
+        self.auto_recovery.setToolTip('Сохранённый поиск может использовать сеть и квоты включённых источников.')
+        limits.addRow(self.auto_recovery)
         search_layout.addLayout(limits)
         self.extra_source_fields = {}
         for setting, title in [('rss_urls', 'RSS-ленты'), ('catalog_urls', 'Каталоги'), ('procurement_urls', 'Публикации закупок')]:
@@ -1126,11 +1228,14 @@ class Window(QMainWindow):
                 'sender.signature': self.sender_signature.text().strip(),
                 'ai.scope': self.ai_scope.currentText(), 'ai.model': self.ai_model.currentText(),
                 'ai.token_limit': self.ai_limit.value(),
+                'ai.auto_assess': self.ai_auto_assess.isChecked(),
+                'research.auto_recovery': self.auto_recovery.isChecked(),
                 'search.exa_enabled': self.exa_enabled.isChecked(),
                 'search.firecrawl_enabled': self.fire_enabled.isChecked(),
                 'search.free_confirmed': self.free_confirmed.isChecked(),
                 'search.request_limit': self.request_limit.value(),
                 'search.page_limit': self.page_limit.value(),
+                'mail.daily_limit': self.mail_daily_limit.value(),
             }
             settings.update({'search.' + name + '_enabled': widget.isChecked()
                              for name, widget in self.source_enabled.items()})
@@ -1179,18 +1284,24 @@ class Window(QMainWindow):
             # Phase 2: one SQLite transaction and compensating credential restore.
             apply_settings(self.store, self.secrets, settings, credentials,
                            mail_values, mail_password, sent_folder=sent_folder)
+            self._auto_recovery_enabled = settings['research.auto_recovery']
+            if not self._auto_recovery_enabled:
+                self.recovery_timer.stop()
             if mail_values is not None:
                 self.mail_status.setText('Подключено' if sent_folder is not None else 'Не подключено')
                 self.mail_disconnect.setVisible(sent_folder is not None)
+                self.mail_folder.setVisible(sent_folder is not None)
                 if not email:
                     self.mail_password.clear()
             if ai_changed:
                 self.update_ai_status()
+            self.update_ai_budget()
             self.statusBar().showMessage('Настройки сохранены.', 5000)
             self.update_search_usage()
             return True
         except Exception as exc:
-            QMessageBox.information(self, 'Настройки', str(exc))
+            error_id = log_exception('Сохранение настроек', exc)
+            QMessageBox.information(self, 'Настройки', humanize_error(exc, error_id))
             return False
 
     def reconcile_ai_usage(self):
@@ -1212,10 +1323,11 @@ class Window(QMainWindow):
             self.ai.reconcile_uncertain_usage(actual, expected_estimate=estimate)
             self.update_ai_status()
         except Exception as exc:
-            QMessageBox.information(self, 'Сверка расхода', str(exc))
+            error_id = log_exception('Сверка расхода GigaChat', exc)
+            QMessageBox.information(self, 'Сверка расхода', humanize_error(exc, error_id))
 
     def update_ai_status(self):
-        usage = self.store.one("SELECT COALESCE(SUM(input_tokens+output_tokens),0) AS total FROM usage_log WHERE provider='gigachat'")['total']
+        usage = self.store.token_usage()
         balance = self.store.get_setting('ai.balance')
         checked = self.store.get_setting('ai.checked_at', '')
         if not checked:
@@ -1237,6 +1349,7 @@ class Window(QMainWindow):
                 if incomplete else '')
         self.ai_status.setText(f'{text}\nПодтверждённый расход: {usage} токенов{tail}')
         self.ai_status.setToolTip(json.dumps(balance, ensure_ascii=False) if balance else '')
+        self.update_ai_budget()
         model = self.ai_model.currentText()
         models = self.store.get_setting('ai.models', [])
         if models:
@@ -1248,9 +1361,15 @@ class Window(QMainWindow):
             if index >= 0:
                 self.ai_model.setCurrentIndex(index)
 
+    def update_ai_budget(self):
+        used = self.store.token_usage()
+        unconfirmed = max(0, int(self.store.get_setting('ai.unconfirmed_tokens', 0) or 0))
+        limit = int(self.store.get_setting('ai.token_limit', 30000))
+        self.ai_budget_status.setText(f'Остаток локального лимита: {max(0, limit - used - unconfirmed)} из {limit} токенов')
+
     def update_search_usage(self):
         self.search_usage_timer.stop()
-        rows = self.store.query("SELECT provider,COUNT(*) AS calls FROM usage_log WHERE provider<>'gigachat' GROUP BY provider")
+        rows = self.store.search_usage()
         counts = {row['provider']: row['calls'] for row in rows}
         # The fields already hold the current credentials. A key edit must not
         # synchronously reread WinVault or inherit verification of the old key.
@@ -1261,7 +1380,11 @@ class Window(QMainWindow):
             state = states.get(name, {}) if bulk_status else (
                 self.research.provider_status(name) if hasattr(self.research, 'provider_status') else {})
             blocked = state.get('status') == 'Отключён: оплата не проверена'
-            if blocked:
+            if name in UNVERIFIABLE_KEYS:
+                text = 'Поиск с ключом недоступен. Провайдер не подтверждает бесплатный режим.'
+            elif name == 'firecrawl' and keys.get(name):
+                text = 'Поиск с ключом недоступен. Очистите поле ключа для доступа по IP.'
+            elif blocked:
                 text = 'Недоступен: оплата не проверена'
             elif not self.source_enabled[name].isChecked():
                 text = 'Отключён'
@@ -1269,8 +1392,14 @@ class Window(QMainWindow):
                 text = state.get('status') or 'Не проверен'
             widget.setText(text)
             widget.setToolTip(state.get('message', 'Нажмите «Проверить» для проверки источника и бесплатного доступа.'))
-            self.source_checks[name].setEnabled(not self.search_check_busy and self.research_cancel is None)
-            self.source_checks[name].setToolTip('Проверить подключение и возможность бесплатного использования')
+            self.source_checks[name].setEnabled(name not in UNVERIFIABLE_KEYS and not self.search_check_busy
+                                                and self.research_cancel is None)
+            self.source_checks[name].setToolTip(text if name in UNVERIFIABLE_KEYS else
+                                                  'Проверить подключение и возможность бесплатного использования')
+            coverage = {'gdelt': 'Англоязычный индекс. Доступны категории, термины с переводом и английские названия.',
+                        'comtrade': 'Кофе, чай и смартфоны. Отдельная статистика импорта вне поиска рынка.'}.get(name)
+            if coverage:
+                widget.setText(f'{text} · {coverage}')
             quota = state.get('quota')
             balance = str(quota) if quota is not None else 'неизвестен'
             self.source_usage[name].setText(f'Учтено запросов: {counts.get(name, 0)} · Остаток квоты: {balance}')
@@ -1309,6 +1438,8 @@ class Window(QMainWindow):
             self.guide('Дождитесь завершения текущего поиска.')
             return
         name = name if isinstance(name, str) else 'firecrawl'
+        if name in UNVERIFIABLE_KEYS:
+            return
         if name in self.source_keys and name != 'firecrawl' and not self.source_keys[name].text().strip():
             self.guide('Введите API-ключ выбранного источника в настройках.', settings=True)
             return
@@ -1353,15 +1484,20 @@ class Window(QMainWindow):
         except ValueError as exc:
             self.mail_error(str(exc))
             return
+        first_connection = self.store.get_setting('mail.warmup_account', '') != email
+        self.mail_cancel.clear()
         self.mail_busy = True
         self.mail_test.setEnabled(False)
         self.mail_status.setText('Проверяем…')
         def verify(emit):
-            return {'sent_folder': self.mail.verify_connection(values, password)}
+            return {'sent_folder': self.mail.verify_connection(values, password, self.mail_cancel)}
 
         def connected(result):
             if not self.save_settings(verified_mail=(values, password, result['sent_folder'])):
                 self.mail_status.setText('Настройки почты не сохранены.')
+            elif first_connection:
+                self.mail_warmup.show()
+                self.store.set_setting('mail.warmup_account', email)
 
         self.submit(verify, connected,
                     failed=self.mail_error, finished=self.mail_finished, busy_message='Подключаем почту')
@@ -1377,7 +1513,16 @@ class Window(QMainWindow):
             self.refresh_mail_button.setEnabled(True)
             account = self.store.one('SELECT connected FROM mail_accounts WHERE id=1') or {}
             self.mail_disconnect.setVisible(bool(account.get('connected')))
+            self.mail_folder.setVisible(bool(account.get('connected')))
             self.refresh_companies()
+
+    def sync_startup_mail(self):
+        if self._closing:
+            return
+        if self._foreground_worker is not None or self.mail_busy:
+            self.startup_mail_timer.start(1000)
+            return
+        self.sync_mail()
 
     def sync_mail(self, manual=False):
         if self._foreground_worker is not None:
@@ -1391,12 +1536,74 @@ class Window(QMainWindow):
             if manual:
                 self.guide('Чтобы проверить ответы, подключите почту в настройках: email, пароль приложения → «Подключить».', settings=True)
             return
+        self.mail_cancel.clear()
         self.mail_busy = True
         self.refresh_mail_button.setEnabled(False)
         def sync(emit):
-            return self.mail.sync()
-        self.submit(sync, failed=self.mail_error if manual else lambda message: self.mail_status.setText(message),
-                    finished=self.mail_finished, busy_message='Проверяем ответы' if manual else None, silent=not manual)
+            return self.mail.sync(self.mail_cancel)
+        def synced(_result):
+            pending = self.mail.pending_opt_outs()
+            if pending:
+                self.guide(f'Возможные просьбы об отписке: {len(pending)}. Откройте «Ещё → Проверить просьбы об отписке».')
+            elif manual:
+                self.statusBar().showMessage(_result, 15000)
+        self.submit(sync, synced, failed=self.mail_error if manual else lambda message: self.mail_status.setText(message),
+                    finished=self.mail_finished, busy_message='Проверяем ответы' if manual else None, silent=True)
+
+    def choose_sent_folder(self):
+        if self.mail_busy or self._foreground_worker is not None:
+            self.guide('Дождитесь завершения работы с почтой.')
+            return
+        self.mail_cancel.clear()
+        self.mail_busy = True
+
+        def choose(folders):
+            current = self.store.one('SELECT sent_folder FROM mail_accounts WHERE id=1') or {}
+            selected = next((i for i, (_, wire) in enumerate(folders) if wire == current.get('sent_folder')), 0)
+            names = []
+            for display, _ in folders:
+                name, suffix = display, 2
+                while name in names:
+                    name = f'{display} ({suffix})'
+                    suffix += 1
+                names.append(name)
+            name, accepted = QInputDialog.getItem(self, 'Отправленные письма', 'Выберите папку отправленных',
+                                                  names, selected, False)
+            if accepted:
+                try:
+                    self.mail.set_sent_folder(folders[names.index(name)][1])
+                except Exception as exc:
+                    self.mail_error(humanize_error(exc, log_exception('Выбор папки отправленных', exc)))
+                    return
+                self.mail_status.setText('Папка отправленных: ' + name)
+
+        self.submit(lambda emit: self.mail.list_folders(self.mail_cancel), choose, failed=self.mail_error,
+                    finished=self.mail_finished, busy_message='Загружаем папки почты')
+
+    def review_opt_outs(self):
+        if self.mail_busy:
+            self.guide('Дождитесь завершения работы с почтой.')
+            return
+        for row in self.mail.pending_opt_outs():
+            box = QMessageBox(QMessageBox.Icon.Question, 'Возможная просьба об отписке',
+                              f"Запретить отправку на {row['sender']}?\nТема письма: {row['subject']}",
+                              parent=self)
+            box.setTextFormat(Qt.TextFormat.PlainText)
+            box.setInformativeText((row['body'] or '')[:500])
+            yes = box.addButton('Запретить отправку', QMessageBox.ButtonRole.YesRole)
+            no = box.addButton('Пропустить это письмо', QMessageBox.ButtonRole.NoRole)
+            later = box.addButton('Решить позже', QMessageBox.ButtonRole.RejectRole)
+            box.setDefaultButton(later)
+            box.exec()
+            choice = box.clickedButton()
+            if choice not in (yes, no):
+                return
+            try:
+                self.mail.resolve_opt_out(row['id'], confirmed=choice is yes)
+            except Exception as exc:
+                self.mail_error(humanize_error(exc, log_exception('Подтверждение отписки', exc)))
+                return
+        self.refresh_companies()
 
     def disconnect_mail(self):
         if self._foreground_worker is not None:
@@ -1408,54 +1615,118 @@ class Window(QMainWindow):
         def done(result):
             self.mail_password.clear()
             self.mail_status.setText('Не подключено')
+            self.mail_warmup.hide()
         self.submit(lambda emit: self.mail.disconnect(), done, finished=self.mail_finished)
 
     def closeEvent(self, event):
         self._closing = True
         self.startup_mail_timer.stop()
         self.recovery_timer.stop()
-        if self.workers:
+        if self.workers or self.pool.activeThreadCount():
             self.timer.stop()
             self.refresh_timer.stop()
             if self.research_cancel is not None:
                 self.research_cancel.set()
-            self.centralWidget().setEnabled(False)
-            self.action_notice.setText('Завершаем текущую операцию…')
-            self.action_row.show()
-            if self.busy_overlay.isVisible():
-                self.busy_overlay.message.setText('Завершаем текущую операцию…')
-            self.statusBar().showMessage('Завершаем текущую операцию…')
-            self.close_timer.start()
+            if self._close_started is None:
+                self._close_started = time.monotonic()
+                self.mail_cancel.set()
+                if self.mail_busy:
+                    self.mail.cancel_network()
+                self.tabs.setEnabled(False)
+                message = 'Завершаем текущую операцию…'
+                self.action_notice.setText(message)
+                self.action_row.show()
+                if self.busy_overlay.isVisible():
+                    self.busy_overlay.message.setText(message)
+                self.statusBar().showMessage(message)
+                self.close_timer.start()
             event.ignore()
         else:
             self.timer.stop()
             self.refresh_timer.stop()
             self.close_timer.stop()
+            self.ai.close()
             self.store.close()
             event.accept()
 
     def _finish_close(self):
         if not self.workers and self.pool.activeThreadCount() == 0:
             self.close()
+        elif time.monotonic() - self._close_started >= 10:
+            self.busy_overlay.stop()
+            self.force_close_button.show()
+
+    def force_close(self):
+        if not confirm(self, 'Закрыть принудительно?',
+                       'Операции в фоне будут прерваны. При следующем запуске проверьте письма с неизвестным статусом.',
+                       'Закрыть принудительно'):
+            return
+        if not self.workers and not self.pool.activeThreadCount():
+            self.close()
+            return
+        # Exit all threads together. SQLite recovers unfinished transactions,
+        # and the next Store launch marks interrupted sends as uncertain.
+        os._exit(0)
+
+
+def acquire_lock(lock):
+    lock.setStaleLockTime(0)
+    if lock.tryLock(0):
+        return True
+    if lock.error() != QLockFile.LockError.LockFailedError:
+        raise OSError('Не удалось открыть файл блокировки приложения.')
+    pid, hostname, process = lock.getLockInfo()
+    if pid > 0 and hostname and process:
+        QMessageBox.information(None, 'SALES MANAGER FIRST', f'Приложение уже открыто (PID {pid}).')
+        return False
+    if not confirm(None, 'Блокировка приложения',
+                   'Файл блокировки повреждён. Если предыдущий экземпляр приложения закрыт, снимите блокировку.',
+                   'Снять блокировку'):
+        return False
+    if lock.tryLock(0):
+        return True
+    pid, hostname, process = lock.getLockInfo()
+    if (pid <= 0 or not hostname or not process) and lock.removeStaleLockFile() and lock.tryLock(0):
+        return True
+    QMessageBox.information(None, 'SALES MANAGER FIRST', 'Блокировка ещё действует. Проверьте, закрыт ли другой экземпляр.')
+    return False
 
 
 def run():
     application = QApplication.instance() or QApplication(sys.argv)
     configure_application(application)
     root = Path(os.environ.get('LOCALAPPDATA', str(Path.home()))) / 'Argon' / 'SalesManagerFirst'
-    root.mkdir(parents=True, exist_ok=True)
-    lock = QLockFile(str(root / 'application.lock'))
-    lock.setStaleLockTime(0)
-    if not lock.tryLock(0):
-        QMessageBox.information(None, 'SALES MANAGER FIRST', 'Приложение уже открыто.')
-        return 0
+    configure_diagnostics(root)
+    lock = None
     try:
+        root.mkdir(parents=True, exist_ok=True)
+        lock = QLockFile(str(root / 'application.lock'))
+        if not acquire_lock(lock):
+            return 0
         window = Window()
-    except Exception:
-        QMessageBox.critical(None, 'Не удалось открыть приложение', 'Не удалось открыть локальные данные или защищённое хранилище Windows.')
-        lock.unlock()
+    except Exception as exc:
+        error_id = log_exception('Запуск приложения', exc)
+        QMessageBox.critical(None, 'Не удалось открыть приложение', humanize_error(exc, error_id))
+        if lock is not None and lock.isLocked():
+            lock.unlock()
         return 1
-    window.show()
-    result = application.exec()
-    lock.unlock()
-    return result
+    previous_hook = sys.excepthook
+
+    def show_unhandled(error_type, exc, traceback):
+        if not isinstance(exc, Exception):
+            previous_hook(error_type, exc, traceback)
+            return
+        error_id = log_exception('Интерфейс приложения', exc)
+        QMessageBox.critical(window, 'Ошибка приложения', humanize_error(exc, error_id))
+
+    sys.excepthook = show_unhandled
+    try:
+        window.show()
+        window.start_maintenance(startup=True)
+        return application.exec()
+    finally:
+        sys.excepthook = previous_hook
+        try:
+            close_provider_http()
+        finally:
+            lock.unlock()

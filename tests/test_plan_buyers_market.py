@@ -1,5 +1,6 @@
 """Regressions for the buyers/market plan: fit, branches, marketplaces, mail."""
 import json
+from datetime import date, datetime, timezone
 from unittest.mock import Mock
 
 import pytest
@@ -8,7 +9,7 @@ from sales_manager.core.contacts import email_purpose
 from sales_manager.core.offer_fields import MAX_SUBJECT_LENGTH
 from sales_manager.research.extraction import is_marketplace, marketplace_seller_hint, parse_page
 from sales_manager.research.fit_rules import evaluate_fit
-from sales_manager.research.market import MARKET_END, MARKET_START, extract_observations, market_ranking
+from sales_manager.research.market import MARKET_START, extract_observations, market_ranking
 from sales_manager.research.normalization import (CONSUMER_ELECTRONICS, IT_EQUIPMENT, branch_identity,
                                                   normalize_product)
 from sales_manager.research.providers import SearchResult
@@ -114,12 +115,12 @@ def test_hq_email_marked_and_subject_limit():
     assert MAX_SUBJECT_LENGTH == 180
 
 
-def test_market_window_2025_2026_and_incomplete_period(research):
-    assert (MARKET_START.year, MARKET_END.year) == (2025, 2026)
-    text = 'В России за январь–март 2026 продажи кофе выросли на 12%.'
-    rows = extract_observations('кофе', text, 'Россия', '2026-04-01')
+def test_market_window_stays_open_after_2026_and_accepts_partial_period(research):
+    assert MARKET_START == date(2025, 1, 1)
+    text = 'В России за январь–март 2027 продажи кофе выросли на 12%.'
+    rows = extract_observations('кофе', text, 'Россия', '2027-02-01')
     assert rows and rows[0]['period']
-    source = research.store.put_source('https://market.example/a', 'Отчёт', text, '2026-04-01')
+    source = research.store.put_source('https://market.example/a', 'Отчёт', text, '2027-02-01')
     product = research.store.ensure_product('кофе')
     for item in rows:
         research.store.execute(
@@ -131,11 +132,27 @@ def test_market_window_2025_2026_and_incomplete_period(research):
             'INSERT INTO market_observation_sources(observation_id,source_id,excerpt,published_at) VALUES(?,?,?,?)',
             (research.store.one('SELECT id FROM market_observations ORDER BY id DESC')['id'], source,
              item['excerpt'], item.get('published_at', '')))
-    ranking = market_ranking(research.store, ['Россия'])
+    assert not market_ranking(research.store, ['Россия'], as_of=datetime(2027, 1, 31, tzinfo=timezone.utc))['rows']
+    ranking = market_ranking(research.store, ['Россия'], as_of=datetime(2027, 2, 1, tzinfo=timezone.utc))
+    assert json.loads(json.dumps(ranking))['latest_publication'] == '2027-02-01'
     assert any(row['name'] == 'кофе' for row in ranking['rows'])
 
 
-def test_sqlite_v6_preserves_ids_permissions_offers_and_mail(tmp_path):
+def test_market_source_parse_cache_is_content_keyed_and_numbers_use_russian_format(monkeypatch):
+    from sales_manager.research import market
+
+    parser = Mock(return_value=[])
+    monkeypatch.setattr(market, 'extract_observations', parser)
+    try:
+        for content in ('оригинал', 'оригинал', 'исправленная публикация'):
+            market._parsed_market_text('кофе', content, 'Россия', '2027-02-01')
+        assert parser.call_count == 2
+        assert market._format_number(1234.5) == '1 234,5'
+    finally:
+        market._parsed_market_text.cache_clear()
+
+
+def test_sqlite_upgrade_preserves_ids_permissions_offers_and_mail(tmp_path):
     path = tmp_path / 'legacy-v5.sqlite3'
     connection = __import__('sqlite3').connect(path)
     scripts = [MIGRATIONS[version] for version in range(1, 6)]
@@ -158,7 +175,7 @@ def test_sqlite_v6_preserves_ids_permissions_offers_and_mail(tmp_path):
                        "VALUES(7,11,'<reply@test>','<msg@test>','incoming','info@alpha.ru','me@mail.ru','Re: Тема','Ответ',?,1)", (stamp,))
     connection.commit()
     migrate(connection)
-    assert connection.execute('PRAGMA user_version').fetchone()[0] == 6
+    assert connection.execute('PRAGMA user_version').fetchone()[0] == max(MIGRATIONS)
     connection.close()
     store = Store(path)
     try:

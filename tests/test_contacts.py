@@ -1,12 +1,12 @@
 """Recipient purpose and exclusion of placeholder addresses."""
 import pytest
 from sales_manager.core.contacts import is_contact_email, email_purpose
-from sales_manager.research.extraction import emails_in
+from sales_manager.research.extraction import emails_in, parse_page
 
 
 @pytest.mark.parametrize('value', ['sales@example.com','info@sub.example.org','a@localhost.test',
                                   'test@firm.ru','test123@firm.ru','dummy-sales@firm.ru',
-                                  'user@firm.ru','person@site.invalid',
+                                  'person@site.invalid',
                                   'name@domain.com','email@domain.com','your@email.com'])
 def test_placeholder_is_not_a_real_company_contact(value):
     assert not is_contact_email(value)
@@ -29,7 +29,7 @@ def test_malformed_syntax_is_not_suggested_as_a_contact(email):
 
 
 @pytest.mark.parametrize('email', ['name@trustedcompany.ru', 'email@actualbusiness.ru',
-                                   'your@actualbusiness.ru', 'sales@firm.ru'])
+                                   'your@actualbusiness.ru', 'sales@firm.ru', 'user@firm.ru', 'user.name@firm.ru'])
 def test_real_company_domains_are_not_rejected_by_placeholder_filter(email):
     assert is_contact_email(email)
     assert emails_in('Для связи: ' + email) == [email]
@@ -62,3 +62,20 @@ def test_previously_saved_template_contacts_are_not_suggested(tmp_path):
             {'email': 'sales@firm.ru', 'purpose': 'Продажи'}]
     finally:
         store.close()
+
+
+def test_idna_email_is_extracted_from_text_and_mailto():
+    page = parse_page('<p>Продажи: sales@фирма.рф.</p><a href="mailto:info@фирма.рф">Email</a>',
+                      'https://фирма.рф/contact', 'Россия')
+    assert page['emails'] == ['info@xn--80apmps.xn--p1ai', 'sales@xn--80apmps.xn--p1ai']
+    assert is_contact_email('sales@xn--80adxhks.xn--p1ai')
+    assert not is_contact_email('sales@-фирма.рф')
+    assert not is_contact_email('sales@фирма.xn--')
+
+
+def test_russian_phones_without_prefix_preserve_context():
+    page = parse_page('<p>(495) 123-45-67</p><p>343-456-78-90</p><p>Тел. 9612345678</p>'
+                      '<p>ИНН 495 675 32 17</p><p>Артикул 9991234567</p>'
+                      '<p>Платёжный оператор: (812) 345-67-89</p>',
+                      'https://firm.ru/contact', 'Россия')
+    assert page['phones'] == ['+73434567890', '+74951234567', '+79612345678']

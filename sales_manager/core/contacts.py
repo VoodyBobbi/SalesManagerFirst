@@ -1,16 +1,38 @@
 """Deterministic contact validation and suggested recipient purpose."""
 import re
 
+import idna
+
+LOCAL_PART = r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+"
+
+
+def ascii_domain(value):
+    try:
+        return idna.encode(value, uts46=True).decode('ascii').lower()
+    except (idna.IDNAError, UnicodeError):
+        return ''
+
+
+def normalize_email(value):
+    local, _, domain = str(value).strip().rpartition('@')
+    local = local.lower()
+    if not re.fullmatch(LOCAL_PART, local, re.ASCII):
+        return ''
+    domain = ascii_domain(domain)
+    tld = domain.rpartition('.')[2]
+    if '.' not in domain or not (tld.startswith('xn--') or re.fullmatch(r'[a-z]{2,63}', tld)):
+        return ''
+    value = f'{local}@{domain}'
+    if len(value) > 254 or len(local) > 64 or local.startswith('.') or local.endswith('.') or '..' in local:
+        return ''
+    return value
+
 
 def is_contact_email(value):
-    value = str(value).strip().casefold()
-    if not re.fullmatch(r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\.[a-z]{2,24}", value):
+    value = normalize_email(value)
+    if not value:
         return False
     local, domain = value.rsplit('@', 1)
-    if len(value) > 254 or len(local) > 64 or local.startswith('.') or local.endswith('.') or '..' in local:
-        return False
-    if any(not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', part) for part in domain.split('.')):
-        return False
     # Frequently copied example addresses that pass ordinary syntax validation.
     # Use exact addresses: a legitimate corporate domain must not be rejected
     # solely because its mailbox is called "name" or "email".
@@ -18,7 +40,12 @@ def is_contact_email(value):
         return False
     if any(domain == root or domain.endswith('.' + root) for root in ('example.com', 'example.org', 'example.net')) or domain.endswith(('.example', '.invalid', '.test', '.localhost')):
         return False
-    return not re.fullmatch(r'(?:test|example|sample|dummy|placeholder|your[-_.]?email|user(?:name)?)(?:[._+-]?\d*)?(?:[._+-].*)?', local)
+    return not re.fullmatch(r'(?:test|example|sample|dummy|placeholder|your[-_.]?email)(?:[._+-]?\d*)?(?:[._+-].*)?', local)
+
+
+def is_service_mailbox(value):
+    local = str(value).partition('@')[0].casefold()
+    return bool(re.fullmatch(r'(?:no[._-]?reply|do[._-]?not[._-]?reply|postmaster|mailer[._-]?daemon)(?:\+.+)?', local))
 
 
 def email_purpose(value):
@@ -40,5 +67,9 @@ def email_purpose(value):
 
 def company_emails(store, company_id):
     rows = store.query("SELECT value FROM company_contacts WHERE company_id=? AND kind='email' ORDER BY id", (company_id,))
-    values = {row['value'].strip().casefold() for row in rows if is_contact_email(row['value'])}
+    values = {normalize_email(row['value']) for row in rows if is_contact_email(row['value'])}
     return [{'email': value, 'purpose': email_purpose(value)[1]} for value in sorted(values, key=lambda v: (email_purpose(v)[0], v))]
+
+
+def recipient_emails(store, company_id):
+    return [row for row in company_emails(store, company_id) if not is_service_mailbox(row['email'])]

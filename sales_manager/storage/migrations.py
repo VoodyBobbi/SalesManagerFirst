@@ -98,8 +98,34 @@ CREATE UNIQUE INDEX company_identity_key ON companies(identity_key) WHERE identi
 CREATE INDEX company_organization_key ON companies(organization_key) WHERE organization_key<>'';
 '''
 
+USAGE_ACCOUNTING = '''
+CREATE TABLE usage_totals(
+    month TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    tokens INTEGER NOT NULL,
+    credits REAL NOT NULL,
+    calls INTEGER NOT NULL,
+    PRIMARY KEY(month,provider,operation)
+);
+CREATE VIEW usage_accounting AS
+    SELECT provider,input_tokens+output_tokens AS tokens,credits,1 AS calls FROM usage_log
+    UNION ALL
+    SELECT provider,tokens,credits,calls FROM usage_totals;
+CREATE INDEX cache_expiry ON cache(expires_at);
+CREATE INDEX usage_log_created_at ON usage_log(created_at);
+CREATE INDEX audit_events_created_at ON audit_events(created_at);
+'''
+
+MAIL_DELIVERY_AND_OPT_OUT = '''
+ALTER TABLE mail_messages ADD COLUMN delivery_body TEXT;
+ALTER TABLE mail_messages ADD COLUMN opt_out_review INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE mail_opt_out_requests(message_id TEXT PRIMARY KEY);
+CREATE INDEX mail_outgoing_sender_time ON mail_messages(lower(sender),sent_at) WHERE direction='outgoing';
+'''
+
 MIGRATIONS = {1: SCHEMA, 2: MARKET_AND_FIT, 3: MARKET_SOURCES, 4: PREDICTABLE_ACTIONS,
-              5: MARKET_PROGRESS, 6: COMPANY_LOCATIONS}
+              5: MARKET_PROGRESS, 6: COMPANY_LOCATIONS, 7: USAGE_ACCOUNTING, 8: MAIL_DELIVERY_AND_OPT_OUT}
 
 def migrate(connection):
     current = connection.execute('PRAGMA user_version').fetchone()[0]

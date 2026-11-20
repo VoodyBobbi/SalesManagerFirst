@@ -1,9 +1,15 @@
 param(
     [ValidateSet('Nuitka','PyInstaller')][string]$Backend='PyInstaller',
-    [string]$Python=''
+    [string]$Python='',
+    [string]$OutputDirectory='',
+    [ValidatePattern('^([A-Fa-f0-9]{40})?$')][string]$SigningCertificateThumbprint='',
+    [string]$TimestampUrl='http://timestamp.digicert.com',
+    [string]$SignTool='signtool.exe'
 )
 $ErrorActionPreference='Stop'
 $repo=Split-Path -Parent $PSScriptRoot
+if(-not $OutputDirectory){$OutputDirectory=Join-Path $repo 'dist'}
+$destination=[IO.Path]::GetFullPath($OutputDirectory)
 if(-not $Python){$Python=Join-Path $repo '.venv\Scripts\python.exe'}
 if(-not (Test-Path -LiteralPath $Python)){throw 'Python environment missing. Create .venv and install requirements.txt first.'}
 $version=& $Python -c "import sys; print(str(sys.version_info.major)+'.'+str(sys.version_info.minor))"
@@ -80,11 +86,16 @@ VSVersionInfo(
         $built=Join-Path $stage 'output\SalesManagerFirst.exe'
     }
     if($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $built)){throw "$Backend build failed."}
-    $destination=Join-Path $repo 'dist'
+    if($SigningCertificateThumbprint){
+        & $SignTool sign /sha1 $SigningCertificateThumbprint /fd SHA256 /tr $TimestampUrl /td SHA256 $built
+        if($LASTEXITCODE -ne 0){throw 'SignTool failed.'}
+        if((Get-AuthenticodeSignature -FilePath $built).Status -ne 'Valid'){throw 'Authenticode signature is invalid.'}
+    }
     New-Item -ItemType Directory -Path $destination -Force | Out-Null
     $exePath=Join-Path $destination 'SalesManagerFirst.exe'
     Copy-Item -LiteralPath $built -Destination $exePath -Force
     $exeHash=(Get-FileHash -LiteralPath $exePath -Algorithm SHA256).Hash
+    "$exeHash  SalesManagerFirst.exe" | Set-Content -LiteralPath (Join-Path $destination 'SHA256SUMS.txt') -Encoding Ascii
     $releaseInfo=[ordered]@{version=$appVersion;source_manifest_sha256=$manifestHash;exe_sha256=$exeHash;exe_bytes=(Get-Item -LiteralPath $exePath).Length;authenticode_status=[string](Get-AuthenticodeSignature -FilePath $exePath).Status;built_utc=[DateTime]::UtcNow.ToString('o')}
     $releaseInfo | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $destination 'release-info.json') -Encoding UTF8
     $releaseInfo | ConvertTo-Json

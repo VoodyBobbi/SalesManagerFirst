@@ -1,8 +1,9 @@
 """Company evidence, mail preview and history, always rendered as plain text."""
 import json
+from html import escape
 from urllib.parse import urlsplit
 
-from PySide6.QtCore import QSignalBlocker, Qt, QUrl
+from PySide6.QtCore import QSignalBlocker, Qt, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices
 from shiboken6 import isValid
 from PySide6.QtWidgets import (
@@ -12,9 +13,9 @@ from PySide6.QtWidgets import (
 )
 
 from sales_manager.storage import now
-from sales_manager.core.contacts import company_emails, email_purpose, is_contact_email
+from sales_manager.core.contacts import email_purpose, is_contact_email, normalize_email, recipient_emails
 from sales_manager.core.offer_fields import MAX_SUBJECT_LENGTH
-from sales_manager.mail.service import save_offer
+from sales_manager.mail.service import offer_delivery_body, save_offer
 from .theme import enable_row_hover, notice_tone
 
 
@@ -33,6 +34,7 @@ def open_site(url):
 
 def confirm(parent, title, text, action='Продолжить'):
     box = QMessageBox(QMessageBox.Icon.Question, title, text, parent=parent)
+    box.setTextFormat(Qt.TextFormat.PlainText)
     box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
     box.button(QMessageBox.StandardButton.Yes).setText(action)
     box.button(QMessageBox.StandardButton.No).setText('Отмена')
@@ -165,7 +167,7 @@ class ManualContactDialog(QDialog):
 
 
 class CompanyDialog(QDialog):
-    def __init__(self, store, product_id, company_id, parent=None):
+    def __init__(self, store, product_id, company_id, parent=None, *, recipient=''):
         super().__init__(parent)
         self.store = store
         self.product_id = product_id
@@ -292,7 +294,8 @@ class CompanyDialog(QDialog):
                                           and not (current.get('fit_key') or '').startswith('manual:'))
                 parent.submit(lambda emit: parent.ai.assess_fit(product_id, company_id, force=True), done,
                               owner=self, failed=failed,
-                              finished=finished, busy_message='GigaChat оценивает применимость товара')
+                              finished=finished, busy_message='GigaChat оценивает применимость товара',
+                              company_id=company_id)
             assess.clicked.connect(evaluate)
             layout.addWidget(assess)
         if self.sources:
@@ -308,7 +311,10 @@ class CompanyDialog(QDialog):
         layout.addWidget(label('Разрешение на контакт'))
         form = QFormLayout()
         self.email = QComboBox()
-        self.email.addItems([row['email'] for row in company_emails(store, company_id)])
+        self.email.addItems([row['email'] for row in recipient_emails(store, company_id)])
+        selected = self.email.findText(recipient)
+        if selected >= 0:
+            self.email.setCurrentIndex(selected)
         self.basis = QLineEdit()
         self.basis.setPlaceholderText('Например: согласие получателя')
         self.evidence = QLineEdit()
@@ -329,7 +335,8 @@ class CompanyDialog(QDialog):
         buttons.button(QDialogButtonBox.StandardButton.Close).setText('Закрыть')
         buttons.accepted.connect(self.save)
         buttons.rejected.connect(self.reject)
-        buttons.button(QDialogButtonBox.StandardButton.Save).setEnabled(self.email.count() > 0)
+        self.permission_save = buttons.button(QDialogButtonBox.StandardButton.Save)
+        self.permission_save.setEnabled(self.email.count() > 0)
         layout.addWidget(buttons)
 
     def add_manual_contact(self):
@@ -348,6 +355,8 @@ class CompanyDialog(QDialog):
             self.fit_notice.setText('Укажите корректный email или телефон и публичную ссылку на источник.')
             self.fit_notice.show()
             return
+        if kind == 'email':
+            value = normalize_email(value)
         source_id = self.store.put_source(source_url, 'Ручной источник контакта',
                                           'Публичная ссылка, указанная пользователем для контакта: ' + value)
         scope = 'hq' if kind == 'email' and email_purpose(value)[1] == 'Общий' else ''
@@ -358,11 +367,12 @@ class CompanyDialog(QDialog):
         previous = self.email.currentText()
         with QSignalBlocker(self.email):
             self.email.clear()
-            self.email.addItems([row['email'] for row in company_emails(self.store, self.company_id)])
+            self.email.addItems([row['email'] for row in recipient_emails(self.store, self.company_id)])
             index = self.email.findText(value if kind == 'email' else previous)
             if index >= 0:
                 self.email.setCurrentIndex(index)
         self.load_permission(self.email.currentText())
+        self.permission_save.setEnabled(self.email.count() > 0)
         self.fit_notice.setText('Контакт добавлен вручную. Отдельно сохраните основание и подтверждение перед отправкой.')
         self.fit_notice.show()
         if self.parent() and hasattr(self.parent(), 'refresh_companies'):
@@ -524,7 +534,8 @@ class HistoryDialog(QDialog):
             if index < 0:
                 return
             message = messages[index]
-            self.text.setPlainText(f"От: {message['sender']}\nКому: {message['recipient']}\nТема: {message['subject']}\n\n{message['body']}")
+            body = message['delivery_body'] if message['delivery_body'] is not None else message['body']
+            self.text.setPlainText(f"От: {message['sender']}\nКому: {message['recipient']}\nТема: {message['subject']}\n\n{body}")
         self.list.currentRowChanged.connect(select)
         layout.addWidget(self.list, 1)
         layout.addWidget(self.text, 3)
@@ -556,7 +567,7 @@ class OfferDialog(QDialog):
         layout.addWidget(label('Кому'))
         self.recipient_choice = QComboBox()
         self.recipient_choice.setObjectName('offerRecipient')
-        contacts = company_emails(self.store, company_id)
+        contacts = recipient_emails(self.store, company_id)
         for contact in contacts:
             mark = ' · головной офис' if contact['purpose'] == 'Общий' else ''
             self.recipient_choice.addItem(contact['email'] + ' · ' + contact['purpose'] + mark, contact['email'])
@@ -586,12 +597,29 @@ class OfferDialog(QDialog):
         self.notice = label('')
         self.notice.setObjectName('notice')
         layout.addWidget(self.notice)
+        self.numeric_notice = label('')
+        self.numeric_notice.setObjectName('warningNotice')
+        self.numeric_notice.hide()
+        layout.addWidget(self.numeric_notice)
+        self.numeric_timer = QTimer(self)
+        self.numeric_timer.setSingleShot(True)
+        self.numeric_timer.setInterval(250)
+        self.numeric_timer.timeout.connect(self.update_numeric_warnings)
+        self.subject.textChanged.connect(lambda *_: self.numeric_timer.start())
+        self.body.textChanged.connect(self.numeric_timer.start)
         self.settings_button = QPushButton('Открыть настройки')
         self.settings_button.clicked.connect(self.open_settings)
         self.settings_button.hide()
         layout.addWidget(self.settings_button)
+        self.permission_button = QPushButton('Открыть разрешение для выбранного адреса')
+        self.permission_button.clicked.connect(self.open_permission)
+        self.permission_button.hide()
+        layout.addWidget(self.permission_button)
         row = QHBoxLayout()
         self.regenerate = QPushButton('Переписать')
+        self.resolve_delivery = QPushButton('Подтвердить, что письмо не отправлено')
+        self.resolve_delivery.clicked.connect(self.confirm_not_sent)
+        self.resolve_delivery.hide()
         self.save_button = QPushButton('Сохранить')
         self.send_button = QPushButton('Отправить')
         self.send_button.setObjectName('primary')
@@ -606,10 +634,12 @@ class OfferDialog(QDialog):
         row.addWidget(close)
         row.addWidget(self.send_button)
         layout.addLayout(row)
+        layout.addWidget(self.resolve_delivery)
         self.load_offer()
 
     def set_busy(self, busy):
         locked = self.delivery_locked()
+        self.resolve_delivery.setVisible(not busy and bool(self.uncertain_attempt()))
         for widget in (self.subject, self.body, self.recipient_choice, self.save_button, self.send_button, self.regenerate):
             widget.setEnabled(not busy and not locked)
         if busy:
@@ -620,8 +650,40 @@ class OfferDialog(QDialog):
         return bool(self.offer and self.store.one("""SELECT id FROM outbound_attempts
             WHERE offer_id=? AND status IN ('sending','uncertain','sent') LIMIT 1""", (self.offer['id'],)))
 
+    def uncertain_attempt(self):
+        if self.offer:
+            return self.store.one("SELECT id,updated_at FROM outbound_attempts WHERE offer_id=? AND status='uncertain'",
+                                  (self.offer['id'],))
+
+    def confirm_not_sent(self):
+        attempt = self.uncertain_attempt()
+        if not attempt:
+            return
+        if self.window.mail_busy:
+            self.notice.setText('Дождитесь завершения проверки почты.')
+            return
+        if not confirm(self, 'Письмо точно не отправлено?',
+                       'Проверьте отправку у почтового провайдера. Отсутствие копии в папке «Отправленные» '
+                       'само по себе ничего не доказывает. Если письмо всё же ушло, следующая отправка создаст дубль.',
+                       'Подтвердить отсутствие отправки'):
+            return
+        if self.window.mail_busy:
+            self.notice.setText('Дождитесь завершения проверки почты.')
+            return
+        try:
+            self.window.mail.confirm_not_sent(self.offer['id'], attempt['id'], attempt['updated_at'])
+        except ValueError as exc:
+            self.set_busy(False)
+            self.notice.setText(str(exc))
+            return
+        self.set_busy(False)
+        self.notice.setText('Черновик разблокирован. Для отправки снова проверьте и подтвердите письмо.')
+        self.window.refresh_companies()
+
     def recipient_changed(self, *_):
         self.recipient = self.recipient_choice.currentData() or ''
+        if hasattr(self, 'permission_button'):
+            self.permission_button.hide()
         if self.recipient and getattr(self, '_missing_recipient', False):
             self._missing_recipient = False
             self.notice.setText('Выбран новый получатель. Проверьте письмо и подтвердите отправку.')
@@ -634,28 +696,40 @@ class OfferDialog(QDialog):
         self.window.open_settings()
         self.reject()
 
+    def open_permission(self):
+        if self.recipient:
+            CompanyDialog(self.store, self.product_id, self.company_id, self.window,
+                          recipient=self.recipient).exec()
+            self.permission_button.hide()
+
     def load_offer(self):
         row = self.store.one('SELECT * FROM offers WHERE product_id=? AND company_id=?', (self.product_id, self.company_id))
         if row:
             self.loaded(row)
         elif not self.window.secrets.get('gigachat_key'):
-            timestamp = now()
-            offer_id = self.store.execute(
-                'INSERT INTO offers(product_id,company_id,subject,body,reason,source_ids,created_at,updated_at) '
-                'VALUES(?,?,\'\',\'\',?,\'[]\',?,?)',
-                (self.product_id, self.company_id, 'Черновик создан вручную.', timestamp, timestamp))
-            self.loaded(self.store.one('SELECT * FROM offers WHERE id=?', (offer_id,)))
+            self.open_manual_draft()
             self.notice.setText('Пустой черновик создан. Заполните тему и текст вручную; для УТП из источников подключите GigaChat.')
         else:
             self.set_busy(True)
             self.window.submit(lambda emit: self.window.ai.generate_offer(self.product_id, self.company_id), self.loaded,
-                               owner=self, failed=self.generation_error, busy_message='GigaChat составляет коммерческое предложение')
+                               owner=self, failed=self.generation_error, busy_message='GigaChat составляет коммерческое предложение',
+                               company_id=self.company_id)
+
+    def open_manual_draft(self):
+        timestamp = now()
+        self.store.execute(
+            "INSERT INTO offers(product_id,company_id,subject,body,reason,source_ids,created_at,updated_at) "
+            "VALUES(?,?,'','',?,'[]',?,?) ON CONFLICT(product_id,company_id) DO NOTHING",
+            (self.product_id, self.company_id, 'Черновик создан вручную.', timestamp, timestamp))
+        self.loaded(self.store.one('SELECT * FROM offers WHERE product_id=? AND company_id=?',
+                                   (self.product_id, self.company_id)))
 
     def loaded(self, row):
         self.offer = row
         self._missing_recipient = False
         self.subject.setText(row['subject'])
         self.body.setPlainText(row['body'])
+        self.update_numeric_warnings()
         if row.get('recipient'):
             index = self.recipient_choice.findData(row['recipient'])
             self._missing_recipient = index < 0
@@ -674,13 +748,26 @@ class OfferDialog(QDialog):
                                 + ('Выберите другой адрес получателя.' if self.recipient_choice.count() else 'Добавьте подтверждённый контакт компании.'))
             notice_tone(self.notice, 'warning')
 
+    def update_numeric_warnings(self):
+        if not self.offer:
+            return []
+        checker = getattr(self.window.ai, 'offer_numeric_warnings', None)
+        draft = dict(self.offer, subject=self.subject.text(), body=self.body.toPlainText())
+        warnings = checker(draft) if checker else self.offer.get('warnings', [])
+        text = 'Проверьте цифры: ' + ' · '.join(warnings[:3]) if warnings else ''
+        if len(warnings) > 3:
+            text += f' · ещё {len(warnings) - 3}'
+        self.numeric_notice.setText(text)
+        self.numeric_notice.setToolTip('<div>' + '<br>'.join(map(escape, warnings)) + '</div>' if warnings else '')
+        self.numeric_notice.setVisible(bool(warnings))
+        return warnings
+
     def generation_error(self, message):
-        self.set_busy(False)
         if self.offer is None:
-            self.save_button.setEnabled(False)
-            self.send_button.setEnabled(False)
+            self.open_manual_draft()
+        self.set_busy(False)
         notice_tone(self.notice, 'error')
-        self.notice.setText(message)
+        self.notice.setText(message + ' Черновик можно заполнить или исправить вручную.')
         self.settings_button.setVisible('ключ' in message.casefold() or 'подключ' in message.casefold() or 'квот' in message.casefold())
 
     def regenerate_offer(self):
@@ -693,7 +780,7 @@ class OfferDialog(QDialog):
         def task(emit):
             return self.window.ai.generate_offer(self.product_id, self.company_id, force=True)
         self.window.submit(task, self.loaded, owner=self, failed=self.generation_error,
-                           busy_message='GigaChat составляет коммерческое предложение')
+                           busy_message='GigaChat составляет коммерческое предложение', company_id=self.company_id)
 
     def save(self, approved=False):
         if not self.offer:
@@ -738,10 +825,16 @@ class OfferDialog(QDialog):
         permission = self.store.one('SELECT id FROM permissions WHERE company_id=? AND lower(email)=lower(?) AND basis<>\'\' AND evidence<>\'\' LIMIT 1', (self.company_id, self.recipient))
         if not permission or self.store.one('SELECT email FROM opt_out WHERE lower(email)=lower(?)', (self.recipient,)):
             self.notice.setText('В карточке компании укажите основание и подтверждение разрешения на контакт. При запрете отправка недоступна.')
+            self.permission_button.show()
             return
+        self.permission_button.hide()
         if not self.save():
             return
-        if not confirm(self, 'Отправить письмо?', f'Адресат: {self.recipient}\nОтправить проверенный текст?', 'Отправить'):
+        footer = offer_delivery_body('').strip()
+        message = f'Адресат: {self.recipient}\nВ конец письма будет добавлено: «{footer}»'
+        if self.update_numeric_warnings():
+            message += '\n' + self.numeric_notice.text()
+        if not confirm(self, 'Отправить письмо?', message, 'Отправить'):
             return
         if not self.save(approved=True):
             return
@@ -751,6 +844,7 @@ class OfferDialog(QDialog):
         selected_recipient, offer_id = self.recipient, self.offer['id']
         self.set_busy(True)
         self.notice.setText('Отправляем письмо. При неизвестном результате повторная отправка автоматически не выполняется.')
+        self.window.mail_cancel.clear()
         self.window.mail_busy = True
         def done(result):
             notice_tone(self.notice, 'success')
@@ -762,10 +856,13 @@ class OfferDialog(QDialog):
             notice_tone(self.notice, 'error')
             self.notice.setText(message)
             self.set_busy(False)
+            self.window.refresh_companies()
             self.settings_button.setVisible(any(word in message.casefold() for word in ('подключ', 'парол', 'gmail', 'почт', 'настройк')))
         worker = self.window.submit(
-            lambda emit: self.window.mail.send_offer(offer_id, recipient=selected_recipient, expected=expected), done,
-            owner=self, failed=failed, finished=self.window.mail_finished, busy_message='Отправляем письмо')
+            lambda emit: self.window.mail.send_offer(offer_id, recipient=selected_recipient, expected=expected,
+                                                     cancel=self.window.mail_cancel), done,
+            owner=self, failed=failed, finished=self.window.mail_finished, busy_message='Отправляем письмо',
+            company_id=self.company_id)
         if worker is None:
             self.window.mail_busy = False
             self.set_busy(False)

@@ -15,6 +15,17 @@ from sales_manager.research.service import ResearchService
 from sales_manager.storage.store import Store
 
 
+def test_overpass_falls_back_once_and_respects_primary_cooldown():
+    from sales_manager.research.providers import OVERPASS_ENDPOINTS
+
+    request = Mock(side_effect=[RateLimitError('429', retry_after=60), {'elements': []}, {'elements': []}])
+    source = OverpassProvider(request)
+    assert source.search('кофе', 'Россия') == []
+    assert source.search('кофе', 'Россия') == []
+    assert [call.args[1] for call in request.call_args_list] == [
+        OVERPASS_ENDPOINTS[0], OVERPASS_ENDPOINTS[1], OVERPASS_ENDPOINTS[1]]
+
+
 @pytest.fixture
 def service(tmp_path):
     store = Store(tmp_path / 'sources.sqlite3')
@@ -23,6 +34,37 @@ def service(tmp_path):
     result.test_keys = keys
     yield result
     store.close()
+
+
+def test_parallel_provider_credits_follow_the_request_row(service):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    first_started, second_finished = Event(), Event()
+
+    def request(method, url, **kwargs):
+        if url.endswith('/first'):
+            first_started.set()
+            assert second_finished.wait(5)
+            return {'costDollars': {'total': 1}}
+        return {'costDollars': {'total': 2}}
+
+    def invoke(path):
+        try:
+            return service._json('GET', 'https://api.exa.ai/' + path)
+        finally:
+            if path == 'second':
+                second_finished.set()
+            service.store.close()
+
+    with patch('sales_manager.research.service.json_http', side_effect=request), ThreadPoolExecutor(2) as pool:
+        first = pool.submit(invoke, 'first')
+        assert first_started.wait(5)
+        second = pool.submit(invoke, 'second')
+        second.result(timeout=5)
+        first.result(timeout=5)
+
+    assert service.store.query('SELECT credits FROM usage_log ORDER BY id') == [{'credits': 1}, {'credits': 2}]
 
 
 def test_keyless_default_is_real_adapters_no_ai(service):
@@ -261,13 +303,22 @@ def test_empty_is_success_not_quota_and_bad_schema_is_not_success(service):
 
 
 def test_firecrawl_auth_required_never_counts_as_success():
-    with patch('sales_manager.research.providers.httpx.Client') as factory:
-        response = factory.return_value.__enter__.return_value.stream.return_value.__enter__.return_value
-        response.status_code = 401
-        response.iter_bytes.return_value = iter([b'{"error":"Unauthorized"}'])
-        response.headers = {}
+    transport = httpx.MockTransport(lambda request: httpx.Response(401, json={'error': 'Unauthorized'}))
+    with httpx.Client(transport=transport) as client, patch('sales_manager.research.providers._provider_client', return_value=client):
         with pytest.raises(MissingKeyError):
             FirecrawlProvider().search('кофе', 'Россия')
+
+
+def test_provider_client_is_pooled_and_closed(monkeypatch):
+    from sales_manager.research import providers
+
+    factory = Mock()
+    monkeypatch.setattr(providers, '_http_client', None)
+    monkeypatch.setattr(providers.httpx, 'Client', factory)
+    assert providers._provider_client() is providers._provider_client()
+    assert factory.call_count == 1
+    providers.close_provider_http()
+    factory.return_value.close.assert_called_once()
 
 
 def test_mediawiki_references_not_claimed_official():

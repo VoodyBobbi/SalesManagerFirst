@@ -136,7 +136,7 @@ def test_schema_four_upgrade_preserves_existing_research_and_user_data(tmp_path)
     connection.execute("INSERT INTO job_queue(run_id,task_key,payload,status) VALUES(1,'a','{}','pending')")
     connection.commit()
     migrate(connection)
-    assert connection.execute('PRAGMA user_version').fetchone()[0] == 6
+    assert connection.execute('PRAGMA user_version').fetchone()[0] == max(MIGRATIONS)
     assert connection.execute('SELECT name FROM products').fetchone()[0] == 'Товар'
     assert connection.execute('SELECT metric FROM market_observations').fetchone()[0] == 'imports'
     assert connection.execute('SELECT status FROM job_queue').fetchone()[0] == 'pending'

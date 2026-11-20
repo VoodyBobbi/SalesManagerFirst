@@ -19,6 +19,7 @@ __pycache__/
 *.log
 .env*
 build/
+dist/
 TEST_REPORT.md
 *.build/
 *.dist/

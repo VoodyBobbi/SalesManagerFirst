@@ -3,6 +3,8 @@ import json
 import socket
 import time
 from datetime import datetime, timezone
+from email.message import EmailMessage
+from email.utils import format_datetime
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -15,6 +17,7 @@ from sales_manager.mail import MailService
 from sales_manager.research.providers import SearchResult
 from sales_manager.research.service import ResearchService
 from sales_manager.storage import Store, now
+from test_mail import Inbox
 
 
 @pytest.mark.parametrize('selection,fit_method', [('market', 'ai'), ('custom', 'manual')])
@@ -134,13 +137,29 @@ def test_market_to_confirmed_send_with_changed_company_email(tmp_path, monkeypat
         smtp.send_message.assert_called_once()
         sent = smtp.send_message.call_args
         assert sent.kwargs['to_addrs'] == ['new@buyer.ru']
-        assert sent.args[0].get_content().replace('\r\n', '\n').rstrip('\n') == offer['body']
         snapshot = store.one("SELECT * FROM mail_messages WHERE direction='outgoing'")
+        delivered = sent.args[0].get_content().replace('\r\n', '\n').rstrip('\n')
+        assert delivered == snapshot['delivery_body']
+        assert delivered.startswith(offer['body']) and 'Чтобы отказаться от писем' in delivered
         assert (snapshot['product_id'], snapshot['company_id'], snapshot['recipient'], snapshot['body']) == (
             pid, cid, 'new@buyer.ru', offer['body'])
         assert store.one('SELECT status FROM outbound_attempts')['status'] == 'sent'
         assert store.one("SELECT email FROM permissions WHERE email='old@buyer.ru'")
         assert completion_calls == (['fit', 'offer'] if fit_method == 'ai' else ['offer'])
+
+        reply = EmailMessage()
+        reply['Message-ID'] = '<workflow-reply@buyer.ru>'
+        reply['In-Reply-To'] = snapshot['message_id']
+        reply['From'] = snapshot['recipient']
+        reply['To'] = snapshot['sender']
+        reply['Subject'] = 'Готовы обсудить'
+        reply['Date'] = format_datetime(datetime.now(timezone.utc))
+        reply.set_content('Ответ тестового получателя.')
+        monkeypatch.setattr(mail, '_imap', lambda *args: Inbox(reply.as_bytes()))
+        assert mail.sync() == 'Новых ответов: 1'
+        assert mail.sync() == 'Почта обновлена'
+        incoming = store.query("SELECT product_id,company_id,in_reply_to,is_reply FROM mail_messages WHERE direction='incoming'")
+        assert incoming == [dict(product_id=pid, company_id=cid, in_reply_to=snapshot['message_id'], is_reply=1)]
     finally:
         client.close()
         store.close()

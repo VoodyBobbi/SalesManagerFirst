@@ -54,9 +54,10 @@ def test_bottom_status_bar_stays_hidden_and_old_indicator_is_unused(window, qtbo
     ('complete', 4, True, 'Работа прервана.'),
     ('failed', 4, True, 'Работа прервана.'),
 ])
-def test_restored_market_summary_is_short_and_uses_real_saved_source_count(window, monkeypatch, status, count, pending, prefix):
+def test_restored_market_summary_is_short_and_uses_real_saved_source_count(window, monkeypatch, qtbot, status, count, pending, prefix):
     run_id = saved_market(window, monkeypatch, status, count, pending)
-    window.restore_research_notices()
+    window.refresh_market()
+    qtbot.waitUntil(lambda: not window.workers)
     text = window.market_research_notice.text()
     assert text.startswith(prefix)
     if not pending:
@@ -119,11 +120,16 @@ def test_regular_company_search_resumes_its_own_run_even_with_newer_manual_pause
 
 
 @pytest.mark.parametrize('name', ['tavily', 'serper', 'exa', 'firecrawl', 'jina'])
-def test_keyed_provider_can_be_verified_without_claiming_free_search(window, name):
+def test_keyed_provider_controls_match_billing_policy(window, name):
     window.secrets.set(name + '_key', 'unverified-test-key')
     window.update_search_usage()
-    assert window.source_checks[name].isEnabled()
-    assert 'бесплатного' in window.source_checks[name].toolTip()
+    if name in ('serper', 'exa', 'jina'):
+        assert not window.source_checks[name].isEnabled()
+        assert window.source_keys[name].isReadOnly()
+        assert 'не подтверждает бесплатный режим' in window.source_status[name].text()
+    else:
+        assert window.source_checks[name].isEnabled()
+        assert 'бесплатного' in window.source_checks[name].toolTip()
 
 
 def test_market_progress_does_not_expose_transport_messages(window, monkeypatch, qtbot):

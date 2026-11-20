@@ -42,6 +42,77 @@ def test_worker_releases_its_connection_before_reporting_completion(window, qtbo
     assert checked == [True]
 
 
+def test_market_loads_off_thread_and_coalesces_country_changes(window, monkeypatch, qtbot):
+    from sales_manager.ui import app
+
+    started, release = threading.Event(), threading.Event()
+    calls = []
+    gui = threading.get_ident()
+
+    def ranking(store, countries):
+        calls.append((threading.get_ident(), countries))
+        if len(calls) == 2:
+            started.set()
+            assert release.wait(4)
+        return {'rows': [{'id': 1, 'name': countries[0]}], 'preliminary': True}
+
+    monkeypatch.setattr(app, 'market_ranking', ranking)
+    window.countries = ['Россия']
+    window.refresh_market()
+    qtbot.waitUntil(lambda: not window.workers)
+    assert window.market_table.item(0, 0).text() == 'Россия'
+    window.refresh_market()
+    try:
+        qtbot.waitUntil(started.is_set)
+        window.research_cancel = threading.Event()
+        window.research_kind = 'market'
+        for _ in range(4):
+            window.refresh_research()
+        window.countries = ['Казахстан']
+        window.refresh_market()
+        assert window.market_table.rowCount() == 0
+        assert window.market_rows == []
+        assert len(calls) == 2
+    finally:
+        window.research_cancel = None
+        release.set()
+        qtbot.waitUntil(lambda: not window.workers)
+    assert [countries for _, countries in calls] == [['Россия'], ['Россия'], ['Казахстан']]
+    assert all(ident != gui for ident, _ in calls)
+    assert window.market_table.item(0, 0).text() == 'Казахстан'
+
+
+def test_budget_and_autorun_controls_are_persisted(window):
+    window.ai_limit.setValue(35000)
+    window.ai_auto_assess.setChecked(False)
+    window.auto_recovery.setChecked(False)
+    assert window.save_settings()
+    assert window.store.get_setting('ai.auto_assess') is False
+    assert window.store.get_setting('research.auto_recovery') is False
+    assert not window.recovery_timer.isActive()
+    assert '35000 из 35000' in window.ai_budget_status.text()
+
+
+def test_rejected_ai_generation_has_editable_draft_after_one_call(window, monkeypatch, qtbot):
+    from unittest.mock import Mock
+
+    product_id = window.store.ensure_product('Кофе')['id']
+    company_id = company(window.store, product_id)
+    window.open_product(product_id)
+    window.secrets.set('gigachat_key', 'test-key')
+    generate = Mock(side_effect=ValueError('Неподтверждённые цифры'))
+    monkeypatch.setattr(window.ai, 'generate_offer', generate, raising=False)
+    draft = OfferDialog(window, company_id)
+    qtbot.addWidget(draft)
+    qtbot.waitUntil(lambda: not window.workers)
+    assert generate.call_count == 1
+    assert draft.save_button.isEnabled()
+    assert 'Неподтверждённые цифры' in draft.notice.text()
+    draft.subject.setText('Тема')
+    draft.body.setPlainText('Проверенный текст')
+    assert draft.save()
+
+
 def test_editing_new_product_does_not_write_or_rebuild_each_character(window, monkeypatch):
     pid = window.store.ensure_product('Кофе')['id']
     window.open_product(pid)
@@ -108,15 +179,14 @@ def test_keyed_controls_explain_unavailability_without_activation_checkbox(windo
     assert window.free_confirmed.isHidden()
     calls = []
     monkeypatch.setattr(window.research, 'test_provider', lambda name: calls.append(name) or 'Бесплатный режим не подтверждён.', raising=False)
-    for name in ('tavily', 'serper', 'exa', 'jina'):
-        assert window.source_enabled[name].isEnabled()
-        assert window.source_checks[name].isEnabled()
+    for name in ('serper', 'exa', 'jina'):
+        assert not window.source_enabled[name].isEnabled()
+        assert not window.source_checks[name].isEnabled()
+        assert window.source_keys[name].isReadOnly()
         window.source_keys[name].setText('synthetic-key')
         window.free_confirmed.setChecked(True)
         window.test_search(name)
-        qtbot.waitUntil(lambda: not window.workers, timeout=5000)
-        assert calls[-1] == name
-    assert len(calls) == 4
+    assert not calls
 
 
 def test_firecrawl_remains_available_without_key_and_blocked_with_one(window):

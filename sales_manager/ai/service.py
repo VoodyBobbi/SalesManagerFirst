@@ -6,6 +6,7 @@ import ssl
 import threading
 import time
 import uuid
+from datetime import date
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
@@ -70,6 +71,12 @@ _CONTEXT_STOP = {'компании', 'компания', 'компанию', 'п
                  'ваших', 'можем', 'можете', 'организации', 'клиентов',
                  'продано', 'проданы', 'продали', 'продала', 'продал', 'продает',
                  'продают', 'составило', 'составляет', 'составили'}
+_PROPOSAL_YEAR = re.compile(
+    r'(?:^|[.!?;\n])\s*(?:(?:коммерческое\s+)?предложение|сотрудничество)\s+на\s*$', re.I)
+_INVITATION_DELAY = re.compile(
+    r'(?:^|[.!?;\n])\s*(?:предлагаем\s+(?:созвониться|встретиться|вернуться к обсуждению|обсудить это)|'
+    r'можем\s+(?:созвониться|встретиться)|давайте\s+(?:созвонимся|встретимся|обсудим это)|'
+    r'как насч[её]т\s+(?:созвона|встречи))\s+через\s*$', re.I)
 
 # Stable identities for units already stored in offers; other dictionary nouns
 # are normalized locally, never by a guessed common stem.
@@ -274,7 +281,7 @@ def _numeric_claims(text):
         precision = None
         if match['calendar_start']:
             identity = ((match['calendar_start'], match['calendar_end']), ('', 'calendar_year'), None, None)
-            yield identity, _number_context(text, start, end) | {'calendar_year'}
+            yield identity, _number_context(text, start, end) | {'calendar_year'}, match.span()
             continue
         if match['date']:
             amount = match['date']
@@ -287,28 +294,31 @@ def _numeric_claims(text):
             upper = match['range_end'] or match['dash_end']
             amount = (_canonical_number(lower), _canonical_number(upper))
         identity = (amount, _quantity_qualifier(text, end), _quantity_direction(text, start, end), precision)
-        yield identity, _number_context(text, start, end)
+        yield identity, _number_context(text, start, end), match.span()
 
 
-def _check_numeric_claims(data, card):
-    """Conservatively reject unsupported quantities, including 100 versus 1000.
+def _nonfactual_number(text, identity, start, end):
+    amount, (magnitude, _), direction, precision = identity
+    if magnitude or direction or precision or not isinstance(amount, str) or not amount.isdigit():
+        return False
+    if not re.fullmatch(r'\d+', text[start:end]):
+        return False
+    before, after = text[:start], text[end:]
+    year = date.today().year
+    if amount in (str(year), str(year + 1)) and _PROPOSAL_YEAR.search(before):
+        return bool(re.match(r'\s+(?:год(?:а|у|ом|е)?\b|г\.(?!\w))', after, re.I))
+    if not _INVITATION_DELAY.search(before):
+        return False
+    return bool(
+        (len(amount) <= 2 and 1 <= int(amount) <= 14 and re.match(r'\s+(?:день|дня|дней)\b', after, re.I))
+        or (amount in {'1', '2', '3', '4'} and re.match(r'\s+недел(?:ю|и|ь)\b', after, re.I))
+    )
 
-    A common four-character word stem is required near matching quantities to
-    avoid citing an unrelated number (e.g. employee count as a city count).
-    This is source-grounding, not a claim of complete semantic fact-checking.
-    """
-    content = '\n'.join(str(data[key]) for key in ('subject', 'body', 'reason'))
-    # Sender's own contact details and supplied proper names are not
-    # statements about the recipient's business.
-    for key in ('product', 'company', 'sender'):
-        fixed = card.get(key)
-        if isinstance(fixed, str) and fixed:
-            content = re.sub(re.escape(fixed), ' ', content, flags=re.I)
-    # Page identifiers and email addresses are checked separately as links;
-    # their digits are not quantitative claims about the recipient.
-    content = re.sub(r'https?://\S+|[a-z0-9._%+\-]+@[a-z0-9.\-]+', ' ', content, flags=re.I)
+
+def _numeric_warnings(data, card, *, allow_nonfactual=False):
+    """Check quantities against cited facts with matching units and context."""
     facts = []
-    cited = set(data.get('source_ids') or (source['id'] for source in card['sources']))
+    cited = set(data.get('source_ids', (source['id'] for source in card['sources'])))
     for source in card['sources']:
         if source['id'] not in cited:
             continue
@@ -318,10 +328,29 @@ def _check_numeric_claims(data, card):
         text = re.sub(r'(?<!\w)\+\d[\d() \u00a0\u202f-]{6,}\d', ' ', text)
         # Don't use URLs or email digits as evidence either.
         text = re.sub(r'https?://\S+|[a-z0-9._%+\-]+@[a-z0-9.\-]+', ' ', text, flags=re.I)
-        facts.extend(_numeric_claims(text))
-    for identity, context in _numeric_claims(content):
-        if not any(identity == candidate and context & words for candidate, words in facts):
-            raise ValueError('УТП содержит неподтверждённые цифры или числовые факты. Проверьте источники.')
+        facts.extend((identity, words) for identity, words, _ in _numeric_claims(text))
+    warnings = []
+    for field, label in (('subject', 'тема'), ('body', 'текст письма'), ('reason', 'обоснование')):
+        content = str(data[field])
+        # Keep character offsets for the excerpt shown beside each warning.
+        for key in ('product', 'company', 'sender'):
+            fixed = card.get(key)
+            if isinstance(fixed, str) and fixed:
+                content = re.sub(re.escape(fixed), lambda match: ' ' * len(match[0]), content, flags=re.I)
+        content = re.sub(r'https?://\S+|[a-z0-9._%+\-]+@[a-z0-9.\-]+',
+                         lambda match: ' ' * len(match[0]), content, flags=re.I)
+        for identity, context, (start, end) in _numeric_claims(content):
+            if allow_nonfactual and field != 'reason' and _nonfactual_number(content, identity, start, end):
+                continue
+            if not any(identity == candidate and context & words for candidate, words in facts):
+                excerpt = str(data[field])[max(0, start - 28):end + 28].split()
+                warnings.append(f'«{" ".join(excerpt)}» ({label})')
+    return list(dict.fromkeys(warnings))
+
+
+def _check_numeric_claims(data, card, *, allow_nonfactual=False):
+    if _numeric_warnings(data, card, allow_nonfactual=allow_nonfactual):
+        raise ValueError('УТП содержит неподтверждённые цифры или числовые факты. Проверьте источники.')
 
 
 class AIService:
@@ -341,6 +370,12 @@ class AIService:
             self._client = httpx.Client(verify=self._tls(self._bundled_ca),
                                         timeout=45, follow_redirects=False)
         return self._client
+
+    def close(self):
+        with self._lock:
+            if self._client is not None and not self._external_client:
+                self._client.close()
+                self._client = None
 
     @staticmethod
     def _tls(bundled_ca=False):
@@ -435,20 +470,20 @@ class AIService:
             if response.status_code >= 500:
                 raise RuntimeError('GigaChat: ошибка сервера авторизации (' + str(response.status_code) + '). Повторите позже.')
             if response.status_code >= 400:
-                raise RuntimeError('GigaChat: ключ или тип доступа не принят.')
+                raise RuntimeError('GigaChat: ключ или тип доступа не принят. Проверьте их в настройках.')
             data = response.json()
             if not isinstance(data, dict) or not isinstance(data.get('access_token'), str) or not data['access_token'].strip():
-                raise ValueError('Missing access token')
+                raise ValueError('В ответе авторизации отсутствует токен.')
             expires = float(data.get('expires_at', time.time() + 1800))
             if not 0 < expires < float('inf'):
-                raise ValueError('Invalid token expiry')
+                raise ValueError('Некорректный срок действия токена.')
             self._token = data['access_token']
             self._expires = expires / 1000 if expires > 10_000_000_000 else expires
             self._credentials_hash = fingerprint
         except httpx.RequestError as exc:
             raise RuntimeError('GigaChat: нет соединения. Проверьте подключение к интернету и повторите.') from exc
         except (KeyError, TypeError, ValueError) as exc:
-            raise RuntimeError('GigaChat: некорректный ответ авторизации.') from exc
+            raise RuntimeError('GigaChat: некорректный ответ авторизации. Повторите позже.') from exc
 
     def test(self, expected_generation=None):
         with self._lock:
@@ -519,7 +554,7 @@ class AIService:
         }
 
     @staticmethod
-    def validate_offer(data, card):
+    def validate_offer(data, card, *, allow_numeric_warnings=False):
         if not isinstance(data, dict) or set(data) != {'subject', 'body', 'reason', 'source_ids'}:
             raise ValueError('GigaChat вернул неподходящую структуру УТП.')
         for key, limit in (('subject', MAX_SUBJECT_LENGTH), ('body', 5000), ('reason', 1000)):
@@ -536,7 +571,8 @@ class AIService:
         data = {**data, 'body': _without_signature(data['body'], signature)}
         if not data['body'].strip():
             raise ValueError('GigaChat вернул пустой текст УТП без подписи.')
-        _check_numeric_claims(data, card)
+        if not allow_numeric_warnings:
+            _check_numeric_claims(data, card, allow_nonfactual=True)
         used_sources = [source for source in card['sources'] if source['id'] in ids]
         plain_content = data['subject'] + ' ' + data['body'] + ' ' + data['reason']
         content = plain_content.casefold()
@@ -553,7 +589,7 @@ class AIService:
             r'ваш\w* (?:проблем|дефицит)', r'срок поставки', r'\bинн\b', r'\bкпп\b',
         )
         if any(re.search(pattern, content) for pattern in prohibited):
-            raise ValueError('УТП содержит непроверенные обещания или утверждения.')
+            raise ValueError('УТП содержит неподтверждённые обещания или утверждения.')
         # Exact quoted statements must be present in supplied evidence.
         for quote in re.findall(r'«([^»]{15,})»', content):
             if not any(quote in str(source.get('text') or '').casefold() for source in used_sources) and quote != str(card['company']).casefold():
@@ -561,8 +597,38 @@ class AIService:
         body = data['body'].strip() + ('\n\n' + signature if signature else '')
         if len(body) > 5000:
             raise ValueError('Текст УТП с подписью превышает допустимую длину.')
-        return {**data, 'subject': data['subject'].strip(), 'body': body,
-                'reason': data['reason'].strip(), 'source_ids': list(dict.fromkeys(ids))}
+        result = {**data, 'subject': data['subject'].strip(), 'body': body,
+                  'reason': data['reason'].strip(), 'source_ids': list(dict.fromkeys(ids))}
+        if allow_numeric_warnings:
+            result['warnings'] = _numeric_warnings(data, card, allow_nonfactual=True)
+        return result
+
+    def offer_numeric_warnings(self, offer):
+        """Recheck an AI draft or its edited text using saved evidence only."""
+        if not offer.get('cache_key'):
+            return []
+        return self._saved_offer_warnings(offer)
+
+    def _saved_offer_warnings(self, offer, card=None):
+        try:
+            ids = json.loads(offer['source_ids'] or '[]')
+        except (TypeError, ValueError):
+            ids = []
+        if not isinstance(ids, list):
+            ids = []
+        ids = list(dict.fromkeys(source_id for source_id in ids if type(source_id) is int))
+        if card is None:
+            try:
+                card = self._card(offer['product_id'], offer['company_id'])
+            except ValueError:
+                card = {'sources': [], 'signature': self.store.get_setting('sender.signature', '')}
+        included = {source['id'] for source in card['sources']}
+        # An offer retains its original citations even if FIT is later changed.
+        missing = [self.store.one('SELECT id,url,title,text FROM sources WHERE id=?', (source_id,))
+                   for source_id in ids if source_id not in included]
+        cited_card = {**card, 'sources': card['sources'] + [source for source in missing if source]}
+        data = {**offer, 'source_ids': ids, 'body': _without_signature(offer['body'], card['signature'])}
+        return _numeric_warnings(data, cited_card, allow_nonfactual=True)
 
     def generate_offer(self, product_id, company_id, force=False):
         with self._lock:
@@ -585,7 +651,7 @@ class AIService:
             prompt = json.dumps(card, ensure_ascii=False, separators=(',', ':'))
             cache_key = hashlib.sha256((PROMPT_VERSION + model + prompt).encode()).hexdigest()
             if old and not force and old['cache_key'] == cache_key:
-                return old
+                return {**old, 'warnings': self._saved_offer_warnings(old, card)}
             generation = self.store.get_setting('ai.connection_generation', '')
             system = (
                 'Напиши короткое персональное деловое предложение на русском. '
@@ -608,7 +674,7 @@ class AIService:
                 if choice.get('finish_reason') not in (None, 'stop'):
                     raise ValueError('Незавершённый ответ GigaChat.')
                 text = choice['message']['content']
-                data = self.validate_offer(json.loads(text), card)
+                data = self.validate_offer(json.loads(text), card, allow_numeric_warnings=True)
             except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
                 raise ValueError('GigaChat вернул некорректный JSON. Повторите создание черновика.') from exc
             timestamp = now()
@@ -641,7 +707,7 @@ class AIService:
                                values + (product_id, company_id, timestamp))
                 saved = db.execute('SELECT * FROM offers WHERE product_id=? AND company_id=?',
                                    (product_id, company_id)).fetchone()
-            return dict(saved)
+            return {**dict(saved), 'warnings': data['warnings']}
 
     def _completion(self, model, system, prompt, schema, operation):
         with self._lock:
@@ -667,8 +733,7 @@ class AIService:
                            ('ai_usage_reconciled', f'Оценка: {estimate}; по данным пользователя: {actual_tokens}', now()))
 
     def _complete_locked(self, model, system, prompt, schema, operation):
-        self._authorize()
-        used = self.store.one("SELECT COALESCE(SUM(input_tokens+output_tokens),0) AS n FROM usage_log WHERE provider='gigachat'")['n']
+        used = self.store.token_usage()
         # A local safety estimate, NOT actual GigaChat tokenization: raw UTF-8
         # bytes per token greatly overestimate Russian prompts and needlessly
         # block drafts. Real consumption is taken exclusively from API usage.

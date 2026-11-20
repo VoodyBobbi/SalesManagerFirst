@@ -2,6 +2,7 @@ import json
 import time
 import hashlib
 import ssl
+from datetime import date
 from pathlib import Path
 import httpx
 import pytest
@@ -90,6 +91,41 @@ def test_rejects_invented_claims_but_accounts_usage(ai_card):
         ai.generate_offer(pid, cid)
     assert store.one('SELECT id FROM offers') is None
     assert store.one('SELECT input_tokens FROM usage_log')['input_tokens'] == 231
+
+
+def test_generated_numbers_are_rechecked_locally_without_another_completion(ai_card):
+    store, pid, cid, sid = ai_card
+    year = date.today().year
+    bad = {
+        'subject': f'Предложение на {year} год',
+        'body': 'Выручка вашей компании составляет 3 млн рублей. Предлагаем созвониться через 2 недели.',
+        'reason': 'Гипотеза: расширение ассортимента.',
+        'source_ids': [sid],
+    }
+    ai, calls = service_with_response(store, sid, bad)
+    first = ai.generate_offer(pid, cid)
+    saved = store.one('SELECT * FROM offers WHERE id=?', (first['id'],))
+    assert saved['body'] == bad['body']
+    assert len(first['warnings']) == 1 and '3 млн рублей' in first['warnings'][0]
+    assert ai.generate_offer(pid, cid)['warnings'] == first['warnings']
+    assert ai.offer_numeric_warnings(saved) == first['warnings']
+    assert ai.offer_numeric_warnings({**saved, 'body': 'Предлагаем созвониться через 3 дня.'}) == []
+    edited = ai.offer_numeric_warnings({**saved, 'body': 'Компания увеличила продажи за 3 дня.'})
+    assert len(edited) == 1 and '3 дня' in edited[0]
+    assert sum(call.url.path.endswith('completions') for call in calls) == 1
+
+
+def test_only_explicit_proposal_timing_is_exempt_from_numeric_warnings(ai_card):
+    store, pid, cid, sid = ai_card
+    next_year = date.today().year + 1
+    offered = {'subject': f'Коммерческое предложение на {next_year} г.',
+               'body': f'Ваша компания увеличила продажи в {next_year} году за 2 недели.',
+               'reason': 'Гипотеза: расширение ассортимента.', 'source_ids': [sid]}
+    ai, _ = service_with_response(store, sid, offered)
+    warnings = ai.generate_offer(pid, cid)['warnings']
+    assert len(warnings) == 2 and all('текст письма' in warning for warning in warnings)
+    proposal = {**offered, 'body': 'Предлагаем созвониться через 2 недели.'}
+    assert AIService.validate_offer(proposal, ai._card(pid, cid))['body'] == proposal['body']
 
 
 def test_unknown_source_rejected(ai_card):

@@ -3,6 +3,7 @@ import threading
 
 import httpx
 import pytest
+from shiboken6 import isValid
 
 from sales_manager.ai import AIService
 from sales_manager.storage import Store
@@ -41,8 +42,9 @@ def window(qtbot, tmp_path, monkeypatch):
     qtbot.addWidget(view)
     view.show()
     yield view
-    qtbot.waitUntil(lambda: not view.workers, timeout=5000)
-    view.close()
+    qtbot.waitUntil(lambda: not isValid(view) or not view.workers, timeout=5000)
+    if isValid(view):
+        view.close()
 
 
 @pytest.mark.parametrize('change', ['key', 'scope', 'key_back'])

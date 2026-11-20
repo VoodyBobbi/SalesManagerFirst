@@ -5,10 +5,17 @@ from itertools import groupby
 from urllib.parse import unquote, urljoin, urlsplit
 
 from bs4 import BeautifulSoup, NavigableString
-from sales_manager.core.contacts import is_contact_email
+from sales_manager.core.contacts import LOCAL_PART, ascii_domain, is_contact_email, normalize_email
 
-EMAIL_RE = re.compile(r'(?<![\w.+-])[a-z0-9.!#$%&\'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\.[a-z]{2,24}\b', re.I)
-PHONE_RE = re.compile(r'(?<!\w)(?:\+\d[\d ()\-.]{8,24}\d|8[ (\-][\d ()\-.]{8,23}\d)(?!\w)')
+EMAIL_RE = re.compile(rf'(?<![\w.+-]){LOCAL_PART}@(?:[^\W_][\w-]*\.)+[^\W_][\w-]*(?![\w-]|\.[\w-])', re.I)
+PHONE_RE = re.compile(r'(?<![\w+])(?:\+\d[\d ()\-.]{8,24}\d|8[ (\-][\d ()\-.]{8,23}\d)(?!\w)')
+RU_PHONE_RE = re.compile(
+    r'(?<![\w+])(?:\([3489][0-9]{2}\)[ \u00a0-]*|[3489][0-9]{2}[ \u00a0-])'
+    r'[0-9]{3}[ \u00a0-][0-9]{2}[ \u00a0-][0-9]{2}(?!\w)')
+LABELLED_PHONE_RE = re.compile(
+    r'\b(?:тел(?:ефон)?|моб|phone)[.: \u00a0]+([3489][0-9]{9})(?!\w)', re.I)
+NON_PHONE_LABEL_RE = re.compile(
+    r'\b(?:ИНН|ОГРНИП|ОГРН|КПП|артикул|SKU|код|ID)\s*[№:#=-]?\s*$', re.I)
 INN_RE = re.compile(r'\bИНН\s*[:№]?\s*(\d{10}|\d{12})\b', re.I)
 DEVELOPER_LABEL = r'\b(?:разработк[аи]|создани[ея]|дизайн)\s+(?:этого\s+)?сайт\w*\b'
 DEVELOPER_CREDIT = r'\b(?:разработчик\w*\s+(?:этого\s+)?сайт\w*|сайт\s+(?:разработан|создан))\b'
@@ -43,6 +50,7 @@ SELLER_NAME = re.compile(
 
 def domain_of(url):
     host = (urlsplit(url).hostname or '').casefold().rstrip('.')
+    host = ascii_domain(host) or host
     return host[4:] if host.startswith('www.') else host
 
 def is_directory(url):
@@ -65,17 +73,33 @@ def marketplace_seller_hint(title='', text='', url=''):
     return name[:180]
 
 def emails_in(text):
-    return sorted({e.casefold().strip('.,;') for e in EMAIL_RE.findall(text)
+    return sorted({normalize_email(e) for e in EMAIL_RE.findall(text)
                    if is_contact_email(e) and not e.casefold().endswith(('.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp'))})
 
 def phone_normalize(value, country=''):
     value = unquote(str(value)).split(';')[0]
-    digits = re.sub(r'\D', '', value)
+    digits = re.sub(r'[^0-9]', '', value)
     if not 10 <= len(digits) <= 15:
         return ''
-    if country == 'Россия' and len(digits) == 11 and digits.startswith('8'):
-        digits = '7' + digits[1:]
-    return ('+' if value.strip().startswith('+') or (country == 'Россия' and digits.startswith('7')) else '') + digits
+    entered_international = value.strip().startswith('+')
+    if country == 'Россия' and not entered_international:
+        if len(digits) == 10 and digits[0] in '3489':
+            return '+7' + digits
+        if len(digits) == 11 and digits[0] in '78':
+            return '+7' + digits[1:]
+    return ('+' if entered_international else '') + digits
+
+
+def phones_in(text, country):
+    explicit = list(PHONE_RE.finditer(text))
+    phones = [match[0] for match in explicit]
+    if country in ('', 'Россия'):
+        for match in RU_PHONE_RE.finditer(text):
+            if (not any(item.start() <= match.start() < item.end() for item in explicit)
+                    and not NON_PHONE_LABEL_RE.search(text[max(0, match.start() - 30):match.start()])):
+                phones.append(match[0])
+        phones.extend(LABELLED_PHONE_RE.findall(text))
+    return phones
 
 
 def parse_feed(xml, url, country=''):
@@ -270,7 +294,7 @@ def _page_contacts_and_legal_ids(soup, country, site_domain, qualified_only=Fals
         developer_emails.update(emails_in(' '.join(snippets['developer'])))
         excluded_emails.update(emails_in(' '.join(snippets['other'])))
         own_text = ' '.join(snippets[''] + snippets['own'])
-        phone_values.update(raw for raw in own_tel + PHONE_RE.findall(own_text) if phone_normalize(raw))
+        phone_values.update(raw for raw in own_tel + phones_in(own_text, country) if phone_normalize(raw))
     phones = {value for raw in phone_values if (value := phone_normalize(raw, country))}
     own_emails = emails - developer_emails - excluded_emails
     return (sorted(own_emails), sorted(phones), sorted(phone_values), sorted(developer_emails - own_emails),

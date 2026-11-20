@@ -1,7 +1,10 @@
 from concurrent.futures import ThreadPoolExecutor
+import json
 import sqlite3
+import time
 import pytest
 from sales_manager.storage import Store, now
+from sales_manager.storage.migrations import MIGRATIONS
 
 
 def test_restart_preserves_products_and_recovers_without_resending(tmp_path):
@@ -30,7 +33,7 @@ def test_constraints_and_evidence_versioning(tmp_path):
     assert a != s.put_source('https://example.org', text='changed')
     with pytest.raises(sqlite3.IntegrityError):
         s.execute('INSERT INTO company_contacts(company_id,kind,value) VALUES(?,?,?)', (999, 'email', 'x@test.ru'))
-    assert s.one('PRAGMA user_version')['user_version'] == 6
+    assert s.one('PRAGMA user_version')['user_version'] == max(MIGRATIONS)
 
 
 def test_parallel_workers_keep_thread_local_connections(tmp_path):
@@ -65,6 +68,11 @@ def test_schema_three_upgrade_releases_old_reserve_and_preserves_usage_and_draft
     assert store.one('SELECT body,recipient FROM offers') == {'body':'Сохранённый текст','recipient':''}
     assert store.one("SELECT COUNT(*) n FROM outbound_attempts WHERE status='sent'")['n'] == 2
     assert store.one("SELECT body,is_reply FROM mail_messages WHERE message_id='<reply@firm.ru>'") == {'body': 'Сохранённая переписка', 'is_reply': 1}
+    assert store.one('PRAGMA auto_vacuum')['auto_vacuum'] == 0
+    store.retention()
+    assert store.one('PRAGMA auto_vacuum')['auto_vacuum'] == 2
+    assert store.token_usage() == 23
+    assert store.one('PRAGMA integrity_check')['integrity_check'] == 'ok'
     store.close()
 
 
@@ -76,3 +84,78 @@ def test_branches_share_company_but_not_offer_history(tmp_path):
         s.execute('INSERT INTO company_fit(product_id,company_id,status) VALUES(?,?,?)', (product['id'], company, 'FIT'))
     s.execute('INSERT INTO mail_messages(product_id,company_id,message_id,direction,body) VALUES(?,?,?,?,?)', (a['id'], company, '<first@test>', 'outbound', 'Бумага'))
     assert not s.query('SELECT * FROM mail_messages WHERE product_id=?', (b['id'],))
+
+
+def test_retention_reclaims_space_preserves_evidence_and_archives_usage(tmp_path):
+    path = tmp_path / 'retention.sqlite3'
+    store = Store(path)
+    old, recent = '2020-01-15T12:00:00+00:00', now()
+    product = store.ensure_product('Товар')['id']
+    company = store.execute('INSERT INTO companies(name,created_at) VALUES(?,?)', ('Компания', recent))
+    offer_id, fit_id, market_id, cache_id, queued_id, old_id, *latest = [
+        store.put_source('https://example.org', text=str(index) + 'x' * 100000)
+        for index in range(8)
+    ]
+    store.execute('INSERT INTO offers(product_id,company_id,subject,body,source_ids,created_at,updated_at) VALUES(?,?,?,?,?,?,?)',
+                  (product, company, 'Тема', 'Письмо', json.dumps([offer_id]), recent, recent))
+    store.execute('INSERT INTO outbound_attempts(offer_id,idempotency_key,message_id,recipient,status,created_at,updated_at) '
+                  "SELECT id,'send-key','<message@example.org>','a@example.org','sent',?,? FROM offers",
+                  (old, old))
+    store.execute('INSERT INTO company_fit(product_id,company_id,status,source_ids) VALUES(?,?,?,?)',
+                  (product, company, 'FIT', json.dumps([fit_id])))
+    store.execute('INSERT INTO market_observations(product_id,source_id,metric,excerpt,event_key,created_at) VALUES(?,?,?,?,?,?)',
+                  (product, market_id, 'demand', 'excerpt', 'evidence', old))
+    store.execute('INSERT INTO cache(key,value,expires_at) VALUES(?,?,?),(?,?,?)',
+                  ('page:v9:live', json.dumps({'source_id': cache_id}), time.time() + 3600,
+                   'provider:v3:expired', 'x' * 200000, time.time() - 60))
+    run_id = store.execute("INSERT INTO job_runs(kind,status,created_at,updated_at) VALUES('companies','interrupted',?,?)",
+                           (recent, recent))
+    store.execute('INSERT INTO job_queue(run_id,task_key,payload) VALUES(?,?,?)',
+                  (run_id, 'company', json.dumps({'result': {'metadata': {'discovery_source_id': queued_id}}})))
+    store.execute("INSERT INTO audit_events(event,created_at) VALUES('research.failed',?),"
+                  "('mail.user_confirmed_not_sent',?),('research.failed',?)", (old, old, recent))
+    with store.db as db:
+        db.executemany('INSERT INTO usage_log(provider,operation,input_tokens,output_tokens,credits,created_at) VALUES(?,?,?,?,?,?)',
+                       [('gigachat', 'offer', 20, 3, 0, old), ('gigachat', 'offer', None, None, 0, old),
+                        ('gigachat', 'offer', 6, 1, 0, recent), ('tavily', 'research_request', 0, 0, 0.25, old),
+                        ('tavily', 'research_request', 0, 0, 0.5, recent)])
+    store.db.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()
+    size_before = path.stat().st_size
+    usage_before, calls_before = store.token_usage(), store.search_usage()
+
+    store.retention()
+    store.retention()
+
+    assert store.token_usage() == usage_before == 30
+    assert store.search_usage() == calls_before == [{'provider': 'tavily', 'calls': 2}]
+    assert store.one("SELECT credits,calls FROM usage_totals WHERE provider='tavily'") == {'credits': 0.25, 'calls': 1}
+    assert store.one("SELECT month,tokens,calls FROM usage_totals WHERE provider='gigachat'") == {
+        'month': '2020-01', 'tokens': 23, 'calls': 2}
+    assert store.one('SELECT COUNT(*) AS count FROM usage_log')['count'] == 2
+    assert {row['id'] for row in store.query('SELECT id FROM sources')} == {
+        offer_id, fit_id, market_id, cache_id, queued_id, *latest}
+    assert store.one('SELECT id FROM sources WHERE id=?', (old_id,)) is None
+    assert store.query('SELECT key FROM cache') == [{'key': 'page:v9:live'}]
+    assert store.query('SELECT event FROM audit_events') == [
+        {'event': 'mail.user_confirmed_not_sent'}, {'event': 'research.failed'}]
+    assert store.one('SELECT status FROM outbound_attempts')['status'] == 'sent'
+    assert path.stat().st_size < size_before
+    store.close()
+
+
+def test_startup_retention_is_throttled_and_damaged_source_ids_prevent_pruning(tmp_path):
+    store = Store(tmp_path / 'retention.sqlite3')
+    for index in range(3):
+        store.put_source('https://example.org', text=str(index))
+    product = store.ensure_product('Товар')['id']
+    company = store.execute('INSERT INTO companies(name,created_at) VALUES(?,?)', ('Компания', now()))
+    store.execute("INSERT INTO company_fit(product_id,company_id,status,source_ids) VALUES(?,?,'FIT','[1,')",
+                  (product, company))
+    store.retention(startup=True)
+    assert store.one('SELECT COUNT(*) AS count FROM sources')['count'] == 3
+    store.execute("UPDATE company_fit SET source_ids='[]'")
+    store.retention(startup=True)
+    assert store.one('SELECT COUNT(*) AS count FROM sources')['count'] == 3
+    store.retention()
+    assert store.one('SELECT COUNT(*) AS count FROM sources')['count'] == 2
+    store.close()

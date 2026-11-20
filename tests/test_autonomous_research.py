@@ -1,6 +1,7 @@
 """Autonomous scheduling: finite plans, durable replay and bounded parallel I/O."""
 import json
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock
 from concurrent.futures import ThreadPoolExecutor
@@ -9,7 +10,7 @@ import pytest
 
 from sales_manager.research.providers import ProviderError, QuotaError, SearchResult
 from sales_manager.research.service import Paused, ResearchService
-from sales_manager.research.safe_http import FetchResult, SafeFetcher
+from sales_manager.research.safe_http import FetchError, FetchResult, SafeFetcher
 from sales_manager.storage import Store
 
 
@@ -140,6 +141,58 @@ def test_parallel_reads_share_one_robots_load_and_respect_origin_delay(monkeypat
         list(pool.map(fetcher._check_robots, ['https://same.example/a', 'https://same.example/b', 'https://same.example/c']))
     assert reads == ['https://same.example/robots.txt']
     assert waits == [1., 1.]
+
+
+def test_provider_request_starts_are_spaced_without_serializing_http(research, monkeypatch):
+    launch = threading.Barrier(3, timeout=5)
+    started = threading.Barrier(3, timeout=5)
+    times = []
+    lock = threading.Lock()
+
+    def http(*args, **kwargs):
+        with lock:
+            times.append(time.monotonic())
+        started.wait()  # All requests can be in flight at the same time.
+        return {}
+
+    def request(number):
+        launch.wait()
+        try:
+            return research._json('GET', f'https://provider.example/{number}')
+        finally:
+            research.store.close()
+
+    monkeypatch.setattr('sales_manager.research.service.json_http', http)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(request, range(3))) == [{}, {}, {}]
+    assert all(second - first >= .29 for first, second in zip(times, times[1:]))
+
+
+@pytest.mark.parametrize('status', [429, 503])
+def test_robots_backoff_is_per_origin_and_retries_after_expiry(status, monkeypatch):
+    fetcher = SafeFetcher()
+    primary = 'https://same.example/robots.txt'
+    other = 'https://other.example/robots.txt'
+    reads = []
+    instant = 100.0
+
+    def robots(url, *args, **kwargs):
+        response = status if url == primary and not reads else 200
+        reads.append(url)
+        return FetchResult(url, response, b'User-agent: *\nAllow: /')
+
+    monkeypatch.setattr(fetcher, '_raw', robots)
+    monkeypatch.setattr('sales_manager.research.safe_http.time.monotonic', lambda: instant)
+    with pytest.raises(FetchError, match='временно недоступен'):
+        fetcher._check_robots('https://same.example/first')
+    instant += 30
+    with pytest.raises(FetchError, match='временно недоступен'):
+        fetcher._check_robots('https://same.example:443/second')
+    fetcher._check_robots('https://other.example/first')
+    assert reads == [primary, other]
+    instant += 30
+    fetcher._check_robots('https://same.example/third')
+    assert reads == [primary, other, primary]
 
 
 def test_gdelt_followups_use_product_translations_and_do_not_repeat_base_query(research, monkeypatch):

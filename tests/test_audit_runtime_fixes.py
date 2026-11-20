@@ -5,9 +5,62 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from sales_manager.research.safe_http import FetchResult, SafeFetcher, RobotsRules
+from sales_manager.research.safe_http import FetchError, FetchResult, SafeFetcher, RobotsRules
 from sales_manager.research.service import Paused, ResearchService
 from sales_manager.storage import Store, now
+
+
+def test_fetch_dns_deadline_bounds_wait_and_outstanding_resolvers(monkeypatch):
+    from sales_manager.research import safe_http
+
+    release = threading.Event()
+    slots = threading.BoundedSemaphore(2)
+    calls = []
+    monkeypatch.setattr(safe_http, '_DNS_SLOTS', slots)
+
+    def blocked(*args):
+        calls.append(threading.current_thread())
+        assert release.wait(5)
+        return ['1.1.1.1']
+
+    monkeypatch.setattr(safe_http, 'public_addresses', blocked)
+    fetcher = SafeFetcher(timeout=.1)
+    start = time.monotonic()
+    try:
+        for _ in range(2):
+            with pytest.raises(FetchError, match='время определения адреса DNS'):
+                fetcher._request('https://example.org/', 1024)
+        with pytest.raises(FetchError, match='DNS занята'):
+            fetcher._request('https://example.org/', 1024)
+        assert len(calls) == 2 and time.monotonic() - start < 1
+    finally:
+        release.set()
+        for thread in calls:
+            thread.join(1)
+    assert all(not thread.is_alive() for thread in calls)
+
+
+def test_diagnostics_keeps_chained_stack_locations_without_messages(tmp_path, monkeypatch):
+    import logging
+    from sales_manager.core import diagnostics
+
+    logger = logging.Logger('test_diagnostics')
+    monkeypatch.setattr(diagnostics, 'logger', logger)
+    diagnostics.configure_diagnostics(tmp_path)
+    try:
+        try:
+            try:
+                raise OSError('Bearer test-secret https://private.example/sensitive')
+            except OSError as exc:
+                raise RuntimeError('customer data password=test-password') from exc
+        except RuntimeError as exc:
+            diagnostics.log_exception('Проверка', exc)
+        log = (tmp_path / 'logs' / 'app.log').read_text(encoding='utf-8')
+        assert 'RuntimeError' in log and 'OSError' in log and 'test_audit_runtime_fixes.py:' in log
+        assert 'test-secret' not in log and 'test-password' not in log and 'private.example' not in log
+    finally:
+        for handler in logger.handlers:
+            handler.close()
 
 
 @pytest.mark.parametrize('declaration', [

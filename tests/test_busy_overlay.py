@@ -66,7 +66,7 @@ def test_busy_card_blocks_modal_dialog_actions_and_releases_owner(window, qtbot)
 def test_background_mail_is_silent_and_does_not_show_busy_card(window, monkeypatch, qtbot):
     window.store.execute('INSERT INTO mail_accounts(id,email,connected,updated_at) VALUES(1,?,1,?)', ('owner@example.org', now()))
     gate = threading.Event()
-    def sync():
+    def sync(cancel):
         gate.wait(3)
         return 'Техническая фоновая проверка завершена'
     monkeypatch.setattr(window.mail, 'sync', sync, raising=False)

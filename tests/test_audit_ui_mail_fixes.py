@@ -50,11 +50,40 @@ def test_saved_correspondence_stays_visible_after_contact_disappears(window):
     window.store.execute('DELETE FROM company_contacts WHERE company_id=?', (cid,))
     window.open_product(pid)
 
-    assert visible_companies(window.store, pid) == []
+    row, = visible_companies(window.store, pid)
+    assert row['id'] == cid and row['email'] == row['sendable_email'] == ''
     for mode in ('Отправлено', 'Ответили'):
         window.company_filter.setCurrentText(mode)
         assert [row['id'] for row in window.company_rows] == [cid]
         assert window.company_table.cellWidget(0, 5) is not None
+
+
+def test_uncertain_row_opens_review_and_requires_explicit_manual_resolution(window, qtbot, monkeypatch):
+    from sales_manager.mail import MailService
+
+    pid = window.store.ensure_product('Картон')['id']
+    cid = company(window.store, pid)
+    oid = offer(window.store, pid, cid)
+    delivery(window.store, oid, status='uncertain')
+    window.mail = MailService(window.store, window.secrets)
+    window.open_product(pid)
+    opened = []
+    monkeypatch.setattr(window, 'preview_offer', opened.append)
+    window.company_table.cellWidget(0, 3).click()
+    assert opened == [cid]
+
+    dialog = OfferDialog(window, cid)
+    qtbot.addWidget(dialog)
+    assert not dialog.resolve_delivery.isHidden()
+    assert not dialog.send_button.isEnabled()
+    monkeypatch.setattr(dialogs, 'confirm', lambda *args: False)
+    dialog.resolve_delivery.click()
+    assert dialog.delivery_locked()
+    monkeypatch.setattr(dialogs, 'confirm', lambda *args: True)
+    dialog.resolve_delivery.click()
+    assert dialog.resolve_delivery.isHidden()
+    assert dialog.send_button.isEnabled()
+    assert window.store.one('SELECT status FROM outbound_attempts') == {'status': 'failed'}
 
 
 def test_regeneration_failure_leaves_existing_draft_editable(window, qtbot, monkeypatch):

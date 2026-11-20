@@ -1,14 +1,19 @@
 import email
+import imaplib
 import smtplib
+import socket
 import threading
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from email import policy
 from email.message import EmailMessage
+from urllib.parse import parse_qs, urlsplit
 from unittest.mock import Mock
 
 import pytest
 
 from sales_manager.mail import MailService
-from sales_manager.mail.service import is_automatic, message_text
+from sales_manager.mail.service import MailCancelled, is_automatic, message_text, offer_delivery_body
 from sales_manager.storage import Store, now
 
 
@@ -61,6 +66,28 @@ def test_send_is_idempotent_and_snapshot_exact(mail_case):
     assert snapshot['body'] == 'Точный текст письма'
     assert snapshot['sender'] == 'owner@sender.test'
     assert store.one('SELECT status FROM outbound_attempts')['status'] == 'sent'
+
+
+def test_default_daily_limit_counts_local_day_for_this_mailbox(mail_case):
+    store, mail, smtp, original, _, cid = mail_case
+    assert mail.send_offer(original) == 'Отправлено'
+    for number in range(2, 22):
+        product = store.ensure_product(f'Товар {number}')['id']
+        store.execute("INSERT INTO company_fit(product_id,company_id,status) VALUES(?,?,'FIT')", (product, cid))
+        candidate = store.execute(
+            'INSERT INTO offers(product_id,company_id,subject,body,approved,created_at,updated_at) VALUES(?,?,?,?,1,?,?)',
+            (product, cid, f'Предложение {number}', 'Текст', now(), now()))
+        if number <= 20:
+            assert mail.send_offer(candidate) == 'Отправлено'
+    with pytest.raises(ValueError, match='дневной лимит.*20'):
+        mail.send_offer(candidate)
+    assert mail.send_offer(original) == 'Уже отправлено'
+    assert len(smtp.messages) == 20
+    assert not store.one('SELECT id FROM outbound_attempts WHERE offer_id=?', (candidate,))
+
+    past = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+    store.execute('UPDATE mail_messages SET sent_at=? WHERE id=1', (past,))
+    assert mail.send_offer(candidate) == 'Отправлено'
 
 
 def test_shared_address_send_ignores_its_own_reservation_but_blocks_other_offer(mail_case):
@@ -153,7 +180,7 @@ def test_recipient_changed_during_smtp_preparation_is_not_silently_overridden(ma
 def test_test_addresses_cannot_be_sent_even_if_they_have_permission(mail_case):
     store, mail, smtp, offer, _, _ = mail_case
     store.execute("UPDATE company_contacts SET value='sales@example.com'")
-    with pytest.raises(ValueError, match='Email компании не найден'):
+    with pytest.raises(ValueError, match='нет email для отправки'):
         mail.send_offer(offer)
     assert not smtp.messages
 
@@ -275,6 +302,97 @@ class Inbox:
         pass
 
 
+@pytest.mark.parametrize('provider, alias', [
+    ('manual', 'owner@sender.test'), ('gmail', 'owner+unsubscribe@sender.test'),
+    ('yandex', 'owner+unsubscribe@sender.test'),
+])
+def test_mailto_unsubscribe_and_footer_are_delivered_and_processed(mail_case, provider, alias):
+    store, mail, smtp, offer, _, _ = mail_case
+    store.execute('UPDATE mail_accounts SET provider=?', (provider,))
+    mail.send_offer(offer)
+    outgoing = email.message_from_bytes(smtp.messages[0][0].as_bytes(), policy=policy.default)
+    raw_header = next(value for name, value in outgoing.raw_items() if name == 'List-Unsubscribe')
+    assert '=?' not in raw_header
+    instructions = urlsplit(str(outgoing['List-Unsubscribe'])[1:-1])
+    assert instructions.scheme == 'mailto' and instructions.path == alias
+    assert outgoing['List-Unsubscribe-Post'] is None
+    wire_body = outgoing.get_content().replace('\r\n', '\n').rstrip('\n')
+    assert wire_body == offer_delivery_body('Точный текст письма')
+    assert store.one('SELECT delivery_body FROM mail_messages')['delivery_body'] == wire_body
+    request = make_reply(outgoing['Message-ID'], reference=False)
+    request.replace_header('To', alias)
+    request.replace_header('Subject', parse_qs(instructions.query)['subject'][0])
+    mail._imap = lambda *args: Inbox(request.as_bytes())
+    assert 'Отказов от писем: 1' in mail.sync()
+    assert store.one('SELECT email FROM opt_out')['email'] == 'buyer@client.ru'
+    assert store.one("SELECT id FROM audit_events WHERE event='mail.opt_out_received'")
+
+    # Old messages can reappear after UIDVALIDITY changes. A verified new
+    # consent must survive reprocessing of this already completed request.
+    store.execute("DELETE FROM opt_out WHERE email='buyer@client.ru'")
+    store.execute("UPDATE mail_accounts SET uidvalidity=''")
+    assert 'Отказов от писем' not in mail.sync()
+    assert not store.query('SELECT email FROM opt_out')
+
+
+@pytest.mark.parametrize('auto', [False, True])
+def test_direct_unsubscribe_alias_ignores_out_of_office(mail_case, auto):
+    store, mail, _, offer, _, _ = mail_case
+    mail.send_offer(offer)
+    original = store.one('SELECT message_id FROM mail_messages')['message_id']
+    request = make_reply(original, reference=False, auto=auto)
+    request.replace_header('To', 'owner+unsubscribe@sender.test')
+    mail._imap = lambda *args: Inbox(request.as_bytes())
+    mail.sync()
+    assert bool(store.one('SELECT email FROM opt_out')) is not auto
+
+
+@pytest.mark.parametrize('confirmed', [False, True])
+def test_text_refusal_waits_for_user_confirmation(mail_case, confirmed):
+    store, mail, _, offer, _, _ = mail_case
+    mail.send_offer(offer)
+    original = store.one('SELECT message_id FROM mail_messages')['message_id']
+    request = make_reply(original)
+    request.set_content('Спасибо за предложение.\nПожалуйста, не пишите больше.')
+    mail._imap = lambda *args: Inbox(request.as_bytes())
+    assert 'Запросов на отписку для проверки: 1' in mail.sync()
+    assert not store.query('SELECT email FROM opt_out')
+    pending = mail.pending_opt_outs()
+    assert len(pending) == 1 and pending[0]['sender'] == 'buyer@client.ru'
+    mail.resolve_opt_out(pending[0]['id'], confirmed)
+    assert not mail.pending_opt_outs()
+    assert bool(store.one('SELECT email FROM opt_out')) is confirmed
+
+
+def test_sync_cancels_blocked_socket_and_preserves_checkpoint(mail_case, monkeypatch):
+    store, mail, _, _, _, _ = mail_case
+    cancel = threading.Event()
+    reading = threading.Event()
+    inbox = Inbox(b'')
+    client, server = socket.socketpair()
+    with client, server, ThreadPoolExecutor(max_workers=1) as pool:
+        client.settimeout(3)
+        inbox.sock = client
+        inbox.file = client.makefile('rb')
+
+        def blocked_uid(*args):
+            reading.set()
+            inbox.file.read(1)
+            return 'NO', []
+
+        inbox.uid = blocked_uid
+        inbox.login = Mock()
+        inbox.shutdown = lambda: inbox.file.close()
+        monkeypatch.setattr(imaplib, 'IMAP4_SSL', lambda *args, **kwargs: inbox)
+        result = pool.submit(mail.sync, cancel)
+        assert reading.wait(1)
+        cancel.set()
+        mail.cancel_network()
+        with pytest.raises(MailCancelled, match='отменена'):
+            result.result(timeout=2)
+    assert store.one('SELECT last_uid FROM mail_accounts')['last_uid'] == 0
+
+
 def test_incremental_sync_preserves_branch_and_ignores_duplicates(mail_case):
     store, mail, _, offer, pid, cid = mail_case
     mail.send_offer(offer)
@@ -393,6 +511,94 @@ def test_delivery_status_is_not_reply():
     msg['Subject'] = 'Delivery Status Notification'
     msg.set_content('Отказ доставки')
     assert is_automatic(msg)
+
+
+def test_no_reply_is_reference_only_but_identified_reply_is_recorded(mail_case):
+    store, mail, smtp, offer, _, cid = mail_case
+    from sales_manager.core.contacts import company_emails, recipient_emails
+    store.execute("INSERT INTO company_contacts(company_id,kind,value) VALUES(?,'email','no-reply@client.ru')", (cid,))
+    assert len(company_emails(store, cid)) == 2
+    assert [item['email'] for item in recipient_emails(store, cid)] == ['buyer@client.ru']
+    with pytest.raises(ValueError, match='действующий email'):
+        mail.send_offer(offer, recipient='no-reply@client.ru')
+    assert not smtp.messages
+    mail.send_offer(offer)
+    original = store.one('SELECT message_id FROM mail_messages')['message_id']
+    reply = make_reply(original, peer='no-reply@client.ru')
+    assert is_automatic(reply)
+    assert is_automatic(make_reply(original, peer='no-reply@client.ru', auto=True), matched_reply=True)
+    mail._imap = lambda *args: Inbox(reply.as_bytes())
+    assert mail.sync() == 'Новых ответов: 1'
+
+
+def test_idna_recipient_uses_ascii_envelope(mail_case):
+    store, mail, smtp, offer, _, _ = mail_case
+    store.execute("UPDATE company_contacts SET value='sales@фирма.рф'")
+    store.execute("UPDATE permissions SET email='sales@xn--80apmps.xn--p1ai'")
+    assert mail.send_offer(offer, recipient='sales@фирма.рф') == 'Отправлено'
+    assert smtp.messages[0][2] == ['sales@xn--80apmps.xn--p1ai']
+
+
+def test_reconcile_uses_localized_sent_folder_and_explicit_exit(mail_case):
+    store, mail, smtp, offer, _, _ = mail_case
+    smtp.send_message = Mock(side_effect=smtplib.SMTPServerDisconnected())
+    with pytest.raises(RuntimeError, match='неизвестен'):
+        mail.send_offer(offer)
+    attempt = store.one('SELECT * FROM outbound_attempts')
+    sent = Mock()
+    russian = '&BB4EQgQ,BEAEMAQyBDsENQQ9BD0ESwQ1-'
+    sent.list.return_value = ('OK', [rb'(\HasNoChildren) "/" "' + russian.encode('ascii') + b'"'])
+    assert mail._sent_folder(sent) == '"' + russian + '"'
+    mail._imap = Mock(return_value=sent)
+    store.execute("UPDATE mail_accounts SET sent_folder='Sent' WHERE id=1")
+    mail._find_message = Mock(side_effect=[False, True])
+    assert mail.reconcile() == 'Подтверждено отправок: 1'
+    assert mail._find_message.call_args.args[1] == '"' + russian + '"'
+    with pytest.raises(ValueError, match='изменился'):
+        mail.confirm_not_sent(offer, attempt['id'], attempt['updated_at'])
+
+    store.execute("UPDATE outbound_attempts SET status='uncertain' WHERE id=?", (attempt['id'],))
+    current = store.one('SELECT * FROM outbound_attempts')
+    mail.confirm_not_sent(offer, current['id'], current['updated_at'])
+    assert store.one('SELECT status FROM outbound_attempts')['status'] == 'failed'
+    assert store.one('SELECT approved FROM offers')['approved'] == 0
+    assert store.one("SELECT details FROM audit_events WHERE event='mail.user_confirmed_not_sent'") == {'details': str(attempt['id'])}
+    assert smtp.send_message.call_count == 1
+
+
+def test_reconcile_checks_selected_folder_then_archive(mail_case):
+    store, mail, smtp, offer, _, _ = mail_case
+    smtp.send_message = Mock(side_effect=smtplib.SMTPServerDisconnected())
+    with pytest.raises(RuntimeError, match='неизвестен'):
+        mail.send_offer(offer)
+    original = store.one('SELECT message_id FROM mail_messages')['message_id']
+    server = Mock()
+    server.list.return_value = ('OK', [
+        rb'(\Noselect) "/" "Not a folder"',
+        (rb'(\HasNoChildren) "/" {15}', b'Copy of my mail'),
+        rb'(\HasNoChildren \All) "/" "[Gmail]/All Mail"',
+    ])
+    selected = []
+
+    def select(folder, readonly):
+        selected.append(folder)
+        return 'OK', []
+
+    def uid(operation, *args):
+        if operation == 'search':
+            return 'OK', [b'17' if selected[-1] == '"[Gmail]/All Mail"' else b'']
+        return 'OK', [(b'header', ('Message-ID: ' + original + '\r\n\r\n').encode())]
+
+    server.select.side_effect = select
+    server.uid.side_effect = uid
+    mail._imap = lambda *args: server
+    assert mail.list_folders() == [
+        ('Автоматически', ''), ('Copy of my mail', '"Copy of my mail"'),
+        ('[Gmail]/All Mail', '"[Gmail]/All Mail"'),
+    ]
+    mail.set_sent_folder('"Copy of my mail"')
+    assert mail.reconcile() == 'Подтверждено отправок: 1'
+    assert selected == ['"Copy of my mail"', '"[Gmail]/All Mail"']
 
 
 def test_failed_permission_test_clears_previous_connection(mail_case):

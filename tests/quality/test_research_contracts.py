@@ -13,7 +13,7 @@ from sales_manager.storage.store import now
 
 @pytest.mark.parametrize('value', [
     'name@domain.com', 'test123@organisation.ru', 'info@example.com',
-    'user@company.ru', 'owner@localhost', 'x..x@company.ru',
+    'owner@localhost', 'x..x@company.ru',
     '.sales@company.ru', 'office@company..ru', 'a@-company.ru',
 ])
 def test_contact_rejects_placeholders_and_invalid_emails(value):
@@ -22,7 +22,7 @@ def test_contact_rejects_placeholders_and_invalid_emails(value):
 
 @pytest.mark.parametrize('value', [
     'zakupki@organisation.ru', 'sales@organisation.ru', 'info@organisation.ru',
-    'firstname.lastname@organisation.ru',
+    'firstname.lastname@organisation.ru', 'user@company.ru',
 ])
 def test_contact_accepts_valid_business_emails(value):
     assert is_contact_email(value)

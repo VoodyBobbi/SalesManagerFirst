@@ -1,15 +1,20 @@
 """TLS mail providers, durable explicit sends and incremental reply sync."""
 import email
+import base64
+import binascii
 import hashlib
 import imaplib
+import io
 import json
 import re
 import smtplib
+import socket
 import sqlite3
 import ssl
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from contextlib import contextmanager
+from datetime import datetime, time as clock_time, timedelta, timezone
 from email import policy
 from email.message import EmailMessage
 from email.utils import format_datetime, formataddr, getaddresses, make_msgid, parseaddr, parsedate_to_datetime
@@ -17,11 +22,18 @@ from email.utils import format_datetime, formataddr, getaddresses, make_msgid, p
 import truststore
 
 from sales_manager.storage import now
-from sales_manager.core.contacts import company_emails, email_purpose, is_contact_email
+from sales_manager.core.contacts import (ascii_domain, company_emails, email_purpose, is_contact_email,
+                                         is_service_mailbox, normalize_email, recipient_emails)
 from sales_manager.core.offer_fields import MAX_SUBJECT_LENGTH
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 MAX_MESSAGE_BYTES = 2_000_000
+DEFAULT_DAILY_LIMIT = 20
+_UNSUBSCRIBE_FOOTER = 'Чтобы отказаться от писем, ответьте «Не пишите».'
+_OPT_OUT_REQUEST = re.compile(r'(?im)^ *(?:пожалуйста[ ,]+)?(?:не пишите\b|отпишите\b|отпишитесь\b|'
+                              r'прошу отписать\b|прошу больше не писать\b|unsubscribe\b|'
+                              r'please (?:unsubscribe\b|remove me\b|stop (?:emailing|writing)\b))')
+_MAILBOX_WIRE = re.compile(r'"(?:[^"\\\x00-\x1f]|\\["\\])*"|[^\s"{}\\\x00-\x1f]+')
 _IMAP_MONTHS = ('Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
                 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec')
 GMAIL_APP_PASSWORD_URL = 'https://myaccount.google.com/apppasswords'
@@ -88,6 +100,65 @@ class SentReconciliationError(RuntimeError):
     """The Sent folder could not confirm an uncertain submission."""
 
 
+class MailCancelled(RuntimeError):
+    """The user cancelled an ongoing mail operation."""
+
+
+class _CancellableMailRead(io.RawIOBase):
+    """Poll for cancellation without exposing brief socket timeouts to BufferedReader."""
+
+    def __init__(self, sock, check_cancelled):
+        super().__init__()
+        self.sock = sock
+        self.check_cancelled = check_cancelled
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        # Winsock may leave a timed read blocked after another thread shuts
+        # down the local socket. Bound each wait while keeping the full timeout.
+        timeout = self.sock.gettimeout()
+        deadline = time.monotonic() + timeout if timeout is not None else float('inf')
+        try:
+            while True:
+                self.check_cancelled()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError('Mail server did not respond')
+                self.sock.settimeout(min(0.2, remaining))
+                try:
+                    return self.sock.recv_into(buffer)
+                except TimeoutError:
+                    continue
+        finally:
+            self.sock.settimeout(timeout)
+
+
+def offer_delivery_body(body):
+    return body + ('\n' if body.endswith('\n') else '\n\n') + _UNSUBSCRIBE_FOOTER
+
+
+def daily_limit(store):
+    limit = store.get_setting('mail.daily_limit', DEFAULT_DAILY_LIMIT)
+    return limit if type(limit) is int and 1 <= limit <= 1000 else DEFAULT_DAILY_LIMIT
+
+
+def _unsubscribe_alias(account):
+    local, domain = account['email'].rsplit('@', 1)
+    return local.split('+', 1)[0] + '+unsubscribe@' + domain
+
+
+def _unsubscribe_token(message_id):
+    return hashlib.sha256(message_id.encode()).hexdigest()[:24]
+
+
+def _recipient_addresses(message):
+    headers = ['To', 'Cc', 'Delivered-To', 'X-Original-To']
+    return {normalize_email(item[1]) for item in getaddresses(
+        [value for header in headers for value in message.get_all(header, [])])}
+
+
 def _authentication_message(account):
     if _is_gmail(account):
         return ('Gmail отклонил вход. Проверьте полный адрес и отдельный пароль приложения Google. '
@@ -98,13 +169,9 @@ def _authentication_message(account):
 
 
 def address(value):
-    parsed = parseaddr(str(value))[1].strip().casefold()
-    if not re.fullmatch(r"[^\s<>@,;]+@[^\s<>@,;]+\.[^\s<>@,;]+", parsed) or '\r' in str(value) or '\n' in str(value):
+    parsed = normalize_email(parseaddr(str(value))[1])
+    if not parsed or '\r' in str(value) or '\n' in str(value):
         raise ValueError('Укажите корректный email.')
-    try:
-        parsed.encode('ascii')
-    except UnicodeEncodeError as exc:
-        raise ValueError('Используйте email латиницей.') from exc
     return parsed
 
 
@@ -132,7 +199,7 @@ def _html_text(part):
         return ''
 
 
-def is_automatic(message):
+def is_automatic(message, *, matched_reply=False):
     auto = str(message.get('Auto-Submitted', '')).casefold().strip()
     if auto and auto != 'no':
         return True
@@ -145,10 +212,29 @@ def is_automatic(message):
     if message.get_param('report-type') in ('delivery-status', 'disposition-notification'):
         return True
     sender = parseaddr(str(message.get('From', '')))[1].casefold()
-    if sender.startswith(('mailer-daemon@', 'postmaster@', 'no-reply@', 'noreply@')):
+    if sender.startswith(('mailer-daemon@', 'postmaster@')) or (is_service_mailbox(sender) and not matched_reply):
         return True
     subject = str(message.get('Subject', '')).casefold()
     return bool(re.match(r'^(?:автоответ|автоматический ответ|auto(?:matic)?\s*reply|out of office|undeliverable|delivery (?:status|failure))\b', subject))
+
+
+def _mailbox_name(folder):
+    """Decode for comparison, keeping the original IMAP argument for commands."""
+    def decode(match):
+        encoded = match[1].replace(',', '/')
+        if not encoded:
+            return '&'
+        try:
+            return base64.b64decode(encoded + '=' * (-len(encoded) % 4), validate=True).decode('utf-16-be')
+        except (binascii.Error, UnicodeError):
+            return match[0]
+    if folder.startswith('"') and folder.endswith('"'):
+        folder = re.sub(r'\\(["\\])', r'\1', folder[1:-1])
+    return re.sub(r'&([A-Za-z0-9+,]*)-', decode, folder)
+
+
+def _mailbox_argument(folder):
+    return folder if folder.isascii() else folder.encode('utf-8')
 
 
 class MailService:
@@ -157,6 +243,47 @@ class MailService:
     def __init__(self, store, secrets):
         self.store, self.secrets = store, secrets
         self._lock = threading.RLock()
+        self._network_lock = threading.Lock()
+        self._active_connections = set()
+        self._cancel = None
+
+    @contextmanager
+    def _cancellable(self, cancel):
+        previous = self._cancel
+        if cancel is not None:
+            self._cancel = cancel
+        try:
+            self._check_cancelled()
+            yield
+        finally:
+            self._cancel = previous
+
+    def _check_cancelled(self):
+        if self._cancel is not None and self._cancel.is_set():
+            raise MailCancelled('Работа с почтой отменена.')
+
+    def _activate(self, connection):
+        if self._cancel is not None:
+            with self._network_lock:
+                self._active_connections.add(connection)
+            self._check_cancelled()
+            sock = getattr(connection, 'sock', None)
+            if isinstance(sock, socket.socket):
+                if connection.file is not None:
+                    connection.file.close()
+                connection.file = io.BufferedReader(_CancellableMailRead(sock, self._check_cancelled))
+
+    def cancel_network(self):
+        """Wake blocked reads after the calling window has set its cancellation event."""
+        with self._network_lock:
+            connections = tuple(self._active_connections)
+        for connection in connections:
+            sock = getattr(connection, 'sock', None)
+            if sock is not None:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
 
     def _authentication_refused(self, account):
         # A previously verified password can be revoked. Require an explicit
@@ -199,16 +326,20 @@ class MailService:
         return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 
     def _imap(self, account, password):
+        self._check_cancelled()
         connection = imaplib.IMAP4_SSL(account['imap_host'], int(account['imap_port']),
                                       ssl_context=self._tls(), timeout=30)
         try:
+            self._activate(connection)
             connection.login(account['email'], password)
+            self._check_cancelled()
             return connection
         except imaplib.IMAP4.abort:
             self._close_imap(connection)
             raise
         except imaplib.IMAP4.error:
             self._close_imap(connection)
+            self._check_cancelled()
             raise self._authentication_refused(account) from None
         except Exception:
             self._close_imap(connection)
@@ -217,93 +348,174 @@ class MailService:
     def _smtp(self, account, password):
         connection = None
         try:
+            self._check_cancelled()
             if int(account['smtp_port']) == 465:
                 connection = smtplib.SMTP_SSL(account['smtp_host'], 465, timeout=30, context=self._tls())
+                self._activate(connection)
             else:
                 connection = smtplib.SMTP(account['smtp_host'], 587, timeout=30)
+                self._activate(connection)
                 connection.ehlo()
+                self._check_cancelled()
                 if not connection.has_extn('starttls'):
                     raise RuntimeError('SMTP-сервер не поддерживает защищённое соединение.')
                 connection.starttls(context=self._tls())
+                self._activate(connection)
+            self._check_cancelled()
             connection.ehlo()
+            self._check_cancelled()
             connection.login(account['email'], password)
+            self._check_cancelled()
             return connection
         except smtplib.SMTPAuthenticationError:
             self._close_smtp(connection)
+            self._check_cancelled()
             raise self._authentication_refused(account) from None
         except Exception:
             self._close_smtp(connection)
             raise
 
-    @staticmethod
-    def _close_imap(connection):
+    def _close_imap(self, connection):
         if connection:
             try:
+                self._check_cancelled()
                 connection.logout()
             except Exception:
-                pass
+                try:
+                    connection.shutdown()
+                except Exception:
+                    pass
+            finally:
+                with self._network_lock:
+                    self._active_connections.discard(connection)
 
-    @staticmethod
-    def _close_smtp(connection):
+    def _close_smtp(self, connection):
         if connection:
             try:
+                self._check_cancelled()
                 connection.quit()
             except Exception:
                 try:
                     connection.close()
                 except Exception:
                     pass
+            finally:
+                with self._network_lock:
+                    self._active_connections.discard(connection)
 
     @staticmethod
     def _sent_folder(connection):
-        status, rows = connection.list()
+        return next(iter(MailService._sent_folders(connection)), '')
+
+    @staticmethod
+    def _folders(connection):
+        listing = connection.list()
+        if not isinstance(listing, tuple) or len(listing) != 2:
+            return []
+        status, rows = listing
         if status != 'OK':
-            return ''
-        candidates = []
+            return []
+        folders = []
         for row in rows or []:
-            if not row:
+            literal = None
+            if isinstance(row, tuple) and len(row) == 2:
+                row, literal = row
+            if not isinstance(row, (bytes, str)) or (literal is not None and not isinstance(literal, bytes)):
                 continue
-            decoded = row.decode('utf-8', errors='replace') if isinstance(row, bytes) else str(row)
-            match = re.match(r'\([^)]*\)\s+(?:"[^"]*"|NIL)\s+(.+)$', decoded)
+            decoded = row.decode('utf-8', errors='replace') if isinstance(row, bytes) else row
+            match = re.fullmatch(r'\(([^)]*)\)\s+(?:"([^"]*)"|NIL)\s+(.+)', decoded)
             if not match:
                 continue
-            folder = match.group(1).strip()
-            if '\\Sent' in decoded or '\\sent' in decoded:
-                return folder
-            if folder.strip('"').casefold() in ('sent', 'sent items', 'sent messages', '&BB4EQgQ/BEAEMAQyBDsENQQ9BD0ESwQ1-'):
-                candidates.append(folder)
-        return candidates[0] if candidates else ''
+            flags = match[1].casefold().split()
+            folder = match[3].strip()
+            if literal is not None and re.fullmatch(r'\{\d+\}', folder):
+                folder = '"' + literal.decode('utf-8', errors='replace').replace('\\', '\\\\').replace('"', '\\"') + '"'
+            if '\\noselect' in flags or '\\nonexistent' in flags or not _MAILBOX_WIRE.fullmatch(folder):
+                continue
+            label = _mailbox_name(folder)
+            leaf = label.rsplit(match[2], 1)[-1] if match[2] else label
+            folders.append((folder, label, leaf.casefold(), flags))
+        return folders
 
-    def test(self):
-        with self._lock:
+    @staticmethod
+    def _sent_folders(connection, include_archive=False):
+        sent, named, archive = [], [], []
+        for folder, _, name, flags in MailService._folders(connection):
+            if '\\sent' in flags:
+                sent.append(folder)
+            elif name in ('sent', 'sent mail', 'sent items', 'sent messages', 'отправленные',
+                          'отправленные письма', 'gesendet', 'envoyés', 'éléments envoyés',
+                          'enviados', 'inviata', 'posta inviata'):
+                named.append(folder)
+            elif include_archive and ('\\all' in flags or '\\archive' in flags or
+                    name in ('all mail', 'all messages', 'archive', 'archives', 'архив', 'вся почта',
+                             'tous les messages', 'alle nachrichten', 'archiv')):
+                archive.append(folder)
+        return list(dict.fromkeys(sent + named + archive))
+
+    def list_folders(self, cancel=None):
+        with self._lock, self._cancellable(cancel):
+            account, password = self._account(require_connected=True)
+            connection = None
+            try:
+                connection = self._imap(account, password)
+                folders = self._folders(connection)
+                self._check_cancelled()
+                if not folders:
+                    raise RuntimeError('Почтовый сервер не вернул список доступных папок.')
+                return [('Автоматически', '')] + [(label, folder) for folder, label, _, _ in folders]
+            except (imaplib.IMAP4.error, OSError) as exc:
+                self._check_cancelled()
+                raise RuntimeError('Не удалось получить список папок. Проверьте соединение с почтой.') from exc
+            finally:
+                self._close_imap(connection)
+
+    def set_sent_folder(self, folder):
+        # Values come from LIST and are persisted as IMAP command arguments.
+        if folder and not _MAILBOX_WIRE.fullmatch(folder):
+            raise ValueError('Выберите папку из списка почтового сервера.')
+        self.store.execute('UPDATE mail_accounts SET sent_folder=?,updated_at=? WHERE id=1', (folder, now()))
+
+    def test(self, cancel=None):
+        with self._lock, self._cancellable(cancel):
             self.store.execute('UPDATE mail_accounts SET connected=0,updated_at=? WHERE id=1', (now(),))
             account, password = self._account()
             sent = self._probe_connection(account, password)
+            self._check_cancelled()
             self.store.execute('UPDATE mail_accounts SET connected=1,sent_folder=?,updated_at=? WHERE id=1',
                                (sent, now()))
             return 'Почта подключена'
 
-    def verify_connection(self, values, password):
-        with self._lock:
+    def verify_connection(self, values, password, cancel=None):
+        with self._lock, self._cancellable(cancel):
             candidate = dict(zip(self.account_fields, values))
             account, password = self._validate_account(candidate, password)
-            return self._probe_connection(account, password)
+            previous = self.store.one('SELECT * FROM mail_accounts WHERE id=1')
+            if previous and all(previous[field] == account[field] for field in self.account_fields):
+                account['sent_folder'] = previous['sent_folder']
+            sent = self._probe_connection(account, password)
+            self._check_cancelled()
+            return sent
 
     def _probe_connection(self, account, password):
         imap = smtp = None
         try:
             imap = self._imap(account, password)
             status, _ = imap.select('INBOX', readonly=True)
+            self._check_cancelled()
             if status != 'OK':
                 raise RuntimeError('Нет права читать входящие письма.')
-            sent = self._sent_folder(imap)
+            sent = account.get('sent_folder') or self._sent_folder(imap)
+            self._check_cancelled()
             smtp = self._smtp(account, password)
             code, _ = smtp.mail(account['email'])
+            self._check_cancelled()
             smtp.rset()
             if code != 250:
                 raise RuntimeError('Почта не разрешает отправку от этого адреса.')
             return sent
         except (imaplib.IMAP4.error, smtplib.SMTPException, OSError) as exc:
+            self._check_cancelled()
             if isinstance(exc, smtplib.SMTPAuthenticationError):
                 raise MailAuthenticationError(_authentication_message(account)) from None
             raise RuntimeError('Почта недоступна. Проверьте интернет и адреса IMAP/SMTP; повторите подключение в настройках.') from exc
@@ -328,9 +540,9 @@ class MailService:
             raise ValueError('Проверьте тему и текст письма.')
         if '\r' in offer['subject'] or '\n' in offer['subject']:
             raise ValueError('Тема письма должна занимать одну строку.')
-        contacts = company_emails(self.store, offer['company_id'])
+        contacts = recipient_emails(self.store, offer['company_id'])
         if not contacts:
-            raise ValueError('Email компании не найден.')
+            raise ValueError('У компании нет email для отправки.')
         recipient = address(recipient if recipient is not None else (offer['recipient'] or contacts[0]['email']))
         if offer['recipient'] and address(offer['recipient']) != recipient:
             self.store.execute('UPDATE offers SET approved=0 WHERE id=?', (offer_id,))
@@ -361,9 +573,22 @@ class MailService:
                 raise ValueError('Идентичное письмо на общий адрес уже отправлено или отправляется с этого ящика.')
         return account, password, offer, recipient
 
-    def send_offer(self, offer_id, recipient=None, expected=None):
+    def _check_daily_limit(self, db, sender):
+        limit = daily_limit(self.store)
+        day = datetime.now().date()
+        start = datetime.combine(day, clock_time.min).astimezone(timezone.utc).isoformat()
+        end = datetime.combine(day + timedelta(days=1), clock_time.min).astimezone(timezone.utc).isoformat()
+        count = db.execute("""
+            SELECT COUNT(*) FROM mail_messages m JOIN outbound_attempts a ON a.message_id=m.message_id
+            WHERE m.direction='outgoing' AND lower(m.sender)=?
+              AND m.sent_at>=? AND m.sent_at<? AND a.status IN ('sending','uncertain','sent')
+        """, (sender.casefold(), start, end)).fetchone()[0]
+        if count >= limit:
+            raise ValueError(f'Достигнут дневной лимит почтового ящика ({limit}). Повторите отправку завтра.')
+
+    def send_offer(self, offer_id, recipient=None, expected=None, cancel=None):
         """An explicit UI confirmation is required before this method is called."""
-        with self._lock:
+        with self._lock, self._cancellable(cancel):
             account, password, offer, recipient = self._send_gate(offer_id, recipient, expected)
             previous = self.store.query('SELECT * FROM outbound_attempts WHERE offer_id=? ORDER BY id DESC', (offer_id,))
             if any(row['status'] == 'sent' for row in previous):
@@ -398,9 +623,21 @@ class MailService:
             msg['Subject'] = offer['subject']
             msg['Date'] = format_datetime(datetime.now(timezone.utc))
             msg['Message-ID'] = message_id
-            msg.set_content(offer['body'])
+            # Mailto works without a web endpoint. Only use plus addressing for
+            # providers known to route the alias to this inbox.
+            unsubscribe_email = (_unsubscribe_alias(account)
+                                 if _is_gmail(account) or account.get('provider') == 'yandex'
+                                 else account['email'])
+            unsubscribe_subject = quote('unsubscribe ' + _unsubscribe_token(message_id))
+            msg['List-Unsubscribe'] = f'<mailto:{quote(unsubscribe_email, safe="@+")}?subject={unsubscribe_subject}>'
+            delivery_body = offer_delivery_body(offer['body'])
+            msg.set_content(delivery_body)
+            # Keep the mailto URL a literal ASCII header even for a long address.
+            # The already encoded MIME body keeps its normal short line width.
+            msg.policy = policy.SMTP.clone(max_line_length=998)
             timestamp = now()
             # One atomic transaction reserves the send and freezes exactly what will be sent.
+            self._check_cancelled()
             with self.store.db:
                 self.store.db.execute('BEGIN IMMEDIATE')
                 # Another service/process may have completed a send since the
@@ -411,6 +648,7 @@ class MailService:
                     return 'Уже отправлено'
                 if any(row['status'] in ('sending', 'uncertain') for row in current):
                     raise ValueError('Исход отправки проверяется. Обновите почту, не отправляйте повторно.')
+                self._check_daily_limit(self.store.db, account['email'])
                 if old:
                     try:
                         cur = self.store.db.execute("UPDATE outbound_attempts SET status='sending',error='',updated_at=? WHERE id=? AND status='failed'", (timestamp, old['id']))
@@ -424,12 +662,12 @@ class MailService:
                                               (offer_id, key, message_id, recipient, 'sending', timestamp, timestamp))
                     except sqlite3.IntegrityError as exc:
                         raise ValueError('Эта отправка уже обрабатывается.') from exc
-                self.store.db.execute('INSERT OR IGNORE INTO mail_messages(product_id,company_id,message_id,direction,sender,recipient,subject,body,sent_at) VALUES(?,?,?,?,?,?,?,?,?)',
+                self.store.db.execute('INSERT OR IGNORE INTO mail_messages(product_id,company_id,message_id,direction,sender,recipient,subject,body,sent_at,delivery_body) VALUES(?,?,?,?,?,?,?,?,?,?)',
                                       (offer['product_id'], offer['company_id'], message_id, 'outgoing',
-                                       account['email'], recipient, offer['subject'], offer['body'], timestamp))
+                                       account['email'], recipient, offer['subject'], offer['body'], timestamp, delivery_body))
                 if old:
-                    self.store.db.execute('UPDATE mail_messages SET sent_at=? WHERE message_id=?',
-                                          (timestamp, message_id))
+                    self.store.db.execute('UPDATE mail_messages SET sent_at=?,delivery_body=? WHERE message_id=?',
+                                          (timestamp, delivery_body, message_id))
             smtp = None
             submitted = False
             try:
@@ -439,6 +677,7 @@ class MailService:
                 if current_account['email'] != account['email'] or current_recipient != recipient or current_offer['subject'] != offer['subject'] or current_offer['body'] != offer['body']:
                     self.store.execute('UPDATE offers SET approved=0 WHERE id=?', (offer_id,))
                     raise ValueError('Текст письма изменился. Проверьте его и повторно подтвердите отправку.')
+                self._check_cancelled()
                 submitted = True
                 refused = smtp.send_message(msg, from_addr=account['email'], to_addrs=[recipient])
                 if refused:
@@ -467,11 +706,14 @@ class MailService:
             except Exception as exc:
                 status = 'uncertain' if submitted else 'failed'
                 error = ('Исход отправки неизвестен. Обновите почту для проверки.' if submitted else
+                         str(exc) if isinstance(exc, MailCancelled) else
                          'Не удалось подключиться к почтовому серверу. Проверьте интернет и настройки почты.'
                          if isinstance(exc, (OSError, smtplib.SMTPException)) else
                          'Ошибка подготовки письма. Черновик сохранён; проверьте его перед повторной отправкой.')
                 self.store.execute('UPDATE outbound_attempts SET status=?,error=?,updated_at=? WHERE message_id=?',
                                    (status, error, now(), message_id))
+                if not submitted:
+                    self._check_cancelled()
                 raise RuntimeError(error) from exc
             finally:
                 self._close_smtp(smtp)
@@ -485,24 +727,41 @@ class MailService:
             connection = self._imap(account, password)
             folder = account.get('sent_folder') or self._sent_folder(connection)
             if folder:
-                if not self._find_message(connection, folder, message['Message-ID']):
-                    connection.append(folder, '\\Seen', imaplib.Time2Internaldate(time.time()), message.as_bytes(policy=policy.SMTP))
+                if not self._find_message(connection, folder, message['Message-ID'], self._check_cancelled):
+                    self._check_cancelled()
+                    connection.append(_mailbox_argument(folder), '\\Seen', imaplib.Time2Internaldate(time.time()), message.as_bytes())
+        except MailCancelled:
+            return
         except Exception:
-            self.store.audit('mail.sent_copy_pending')
+            if self._cancel is None or not self._cancel.is_set():
+                self.store.audit('mail.sent_copy_pending')
         finally:
             self._close_imap(connection)
 
     @staticmethod
-    def _find_message(connection, folder, message_id):
-        status, _ = connection.select(folder, readonly=True)
+    def _find_message(connection, folder, message_id, check_cancelled=None):
+        if check_cancelled:
+            check_cancelled()
+        try:
+            status, _ = connection.select(_mailbox_argument(folder), readonly=True)
+        except imaplib.IMAP4.abort:
+            raise
+        except imaplib.IMAP4.error as exc:
+            raise SentReconciliationError('Не удалось открыть папку отправленных для проверки копии.') from exc
+        if check_cancelled:
+            check_cancelled()
         if status != 'OK':
             raise SentReconciliationError('Не удалось открыть папку отправленных для проверки копии.')
         status, result = connection.uid('search', None, 'HEADER', 'Message-ID', '"' + message_id.replace('"', '') + '"')
+        if check_cancelled:
+            check_cancelled()
         if status != 'OK' or not result or not isinstance(result[0], bytes):
             raise SentReconciliationError('Не удалось проверить копию в отправленных.')
         # Confirm the full Message-ID header, not just a substring search.
         for uid in result[0].split():
             state, data = connection.uid('fetch', uid, '(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])')
+            if check_cancelled:
+                check_cancelled()
             if state != 'OK':
                 raise SentReconciliationError('Не удалось прочитать заголовок отправленного письма.')
             raw = next((item[1] for item in data or [] if isinstance(item, tuple) and len(item) > 1 and isinstance(item[1], bytes)), None)
@@ -516,8 +775,8 @@ class MailService:
                 return True
         return False
 
-    def reconcile(self):
-        with self._lock:
+    def reconcile(self, cancel=None):
+        with self._lock, self._cancellable(cancel):
             account, password = self._account(require_connected=True)
             attempts = self.store.query(
                 "SELECT a.* FROM outbound_attempts a JOIN mail_messages m ON m.message_id=a.message_id WHERE a.status='uncertain' AND m.sender=?",
@@ -528,28 +787,66 @@ class MailService:
             found = 0
             try:
                 connection = self._imap(account, password)
-                folder = account.get('sent_folder') or self._sent_folder(connection)
-                if not folder:
-                    raise SentReconciliationError('Папка отправленных не найдена.')
+                preferred = account.get('sent_folder')
+                fallback = None
+                checked = False
                 for attempt in attempts:
-                    if self._find_message(connection, folder, attempt['message_id']):
-                        self.store.execute("UPDATE outbound_attempts SET status='sent',error='',updated_at=? WHERE id=?", (now(), attempt['id']))
-                        found += 1
+                    if preferred:
+                        try:
+                            confirmed = self._find_message(connection, preferred, attempt['message_id'], self._check_cancelled)
+                            checked = True
+                            if confirmed:
+                                self._check_cancelled()
+                                found += self._confirm_attempt(attempt['id'])
+                                continue
+                        except SentReconciliationError:
+                            pass
+                    if fallback is None:
+                        self._check_cancelled()
+                        fallback = [folder for folder in self._sent_folders(connection, include_archive=True) if folder != preferred]
+                        self._check_cancelled()
+                    for folder in fallback:
+                        try:
+                            confirmed = self._find_message(connection, folder, attempt['message_id'], self._check_cancelled)
+                            checked = True
+                        except SentReconciliationError:
+                            continue
+                        if confirmed:
+                            self._check_cancelled()
+                            found += self._confirm_attempt(attempt['id'])
+                            break
+                if not checked:
+                    raise SentReconciliationError('Не удалось проверить папки отправленных. Проверьте выбранную папку в настройках почты.')
                 return 'Подтверждено отправок: ' + str(found)
             except (imaplib.IMAP4.error, OSError) as exc:
+                self._check_cancelled()
                 raise SentReconciliationError('Не удалось проверить отправленные письма.') from exc
             finally:
                 self._close_imap(connection)
 
+    def _confirm_attempt(self, attempt_id):
+        with self.store.db as db:
+            return db.execute("UPDATE outbound_attempts SET status='sent',error='',updated_at=? "
+                              "WHERE id=? AND status='uncertain'", (now(), attempt_id)).rowcount
+
+    def confirm_not_sent(self, offer_id, attempt_id, updated_at):
+        """Record explicit user verification and unlock the draft for a new confirmation."""
+        timestamp = now()
+        with self._lock, self.store.db as db:
+            result = db.execute("UPDATE outbound_attempts SET status='failed',error=?,updated_at=? "
+                                "WHERE id=? AND offer_id=? AND status='uncertain' AND updated_at=?",
+                                ('Пользователь подтвердил отсутствие отправки.', timestamp, attempt_id, offer_id, updated_at))
+            if result.rowcount != 1:
+                raise ValueError('Статус отправки изменился. Обновите письмо.')
+            db.execute('UPDATE offers SET approved=0,updated_at=? WHERE id=?', (timestamp, offer_id))
+            db.execute('INSERT INTO audit_events(event,details,created_at) VALUES(?,?,?)',
+                       ('mail.user_confirmed_not_sent', str(attempt_id), timestamp))
+
     def _match_reply(self, message, account):
-        peer = parseaddr(str(message.get('From', '')))[1].strip().casefold()
+        peer = normalize_email(parseaddr(str(message.get('From', '')))[1])
         if not peer or peer == account['email']:
             return None
-        recipients = {item[1].casefold() for item in getaddresses(message.get_all('To', []) + message.get_all('Cc', []))}
-        # Delivered-To helps mailboxes receiving BCC replies.
-        delivered = message.get_all('Delivered-To', []) + message.get_all('X-Original-To', [])
-        recipients.update(item[1].strip().casefold() for item in getaddresses(delivered))
-        if account['email'] not in recipients:
+        if account['email'] not in _recipient_addresses(message):
             return None
         # The immediate parent wins over older References, including parents that
         # are already matched inbound messages in the same product workspace.
@@ -572,23 +869,81 @@ class MailService:
         if not is_contact_email(peer):
             return False
         original = parent['recipient'] if parent['direction'] == 'outgoing' else parent['sender']
-        if peer == original.casefold():
+        if peer == normalize_email(original):
             return True
         contacts = {row['email'] for row in company_emails(self.store, parent['company_id'])}
         if peer in contacts:
             return True
         company = self.store.one('SELECT domain,url FROM companies WHERE id=?', (parent['company_id'],)) or {}
-        domains = {original.rsplit('@', 1)[-1].casefold(),
-                   str(company.get('domain') or '').casefold().removeprefix('www.'),
-                   (urlsplit(company.get('url') or '').hostname or '').casefold().removeprefix('www.')}
+        domains = {ascii_domain(host).removeprefix('www.') for host in (
+            original.rsplit('@', 1)[-1], company.get('domain') or '',
+            urlsplit(company.get('url') or '').hostname or '')}
         shared = {'gmail.com', 'googlemail.com', 'yandex.ru', 'yandex.com', 'ya.ru', 'mail.ru', 'bk.ru',
                   'list.ru', 'inbox.ru', 'outlook.com', 'hotmail.com', 'yahoo.com', 'rambler.ru', 'icloud.com', 'proton.me', 'protonmail.com'}
         peer_domain = peer.rsplit('@', 1)[-1]
         return any(domain and not any(domain == host or domain.endswith('.' + host) for host in shared)
                    and (peer_domain == domain or peer_domain.endswith('.' + domain)) for domain in domains)
 
-    def sync(self):
-        with self._lock:
+    def _automatic_opt_out(self, message, account, message_id):
+        peer = normalize_email(parseaddr(str(message.get('From', '')))[1])
+        if not peer or is_automatic(message):
+            return False
+        recipients = _recipient_addresses(message)
+        direct = _unsubscribe_alias(account) in recipients
+        encoded = re.fullmatch(r'unsubscribe ([0-9a-f]{24})',
+                               str(message.get('Subject', '')).strip().casefold())
+        if not direct and not (encoded and account['email'] in recipients):
+            return False
+        outbound = self.store.query("""
+            SELECT m.message_id FROM mail_messages m JOIN outbound_attempts a ON a.message_id=m.message_id
+            WHERE m.direction='outgoing' AND lower(m.sender)=? AND lower(m.recipient)=?
+              AND a.status IN ('sent','uncertain')
+        """, (account['email'], peer))
+        if not outbound or (encoded and not any(_unsubscribe_token(row['message_id']) == encoded[1]
+                                                for row in outbound)):
+            return False
+        self._check_cancelled()
+        with self.store.db as db:
+            logged = db.execute('INSERT OR IGNORE INTO mail_opt_out_requests(message_id) VALUES(?)', (message_id,))
+            if logged.rowcount != 1:
+                return False
+            return self._record_opt_out(db, peer, 'Запрос на отписку по почте', 'mail.opt_out_received')
+
+    @staticmethod
+    def _record_opt_out(db, peer, reason, event):
+        timestamp = now()
+        inserted = db.execute('INSERT OR IGNORE INTO opt_out(email,reason,created_at) VALUES(?,?,?)',
+                              (peer, reason, timestamp))
+        if inserted.rowcount:
+            db.execute('INSERT INTO audit_events(event,details,created_at) VALUES(?,?,?)',
+                       (event, peer, timestamp))
+        return bool(inserted.rowcount)
+
+    def pending_opt_outs(self):
+        return self.store.query("SELECT id,sender,subject,body FROM mail_messages "
+                                "WHERE direction='incoming' AND opt_out_review=1 ORDER BY id")
+
+    def resolve_opt_out(self, message_id, confirmed):
+        with self.store.db as db:
+            result = db.execute("UPDATE mail_messages SET opt_out_review=2 "
+                                "WHERE direction='incoming' AND opt_out_review=1 AND id=? RETURNING sender",
+                                (message_id,)).fetchone()
+            if result is None:
+                raise ValueError('Этот запрос на отписку уже проверен.')
+            if confirmed:
+                self._record_opt_out(db, result[0], 'Отказ по письму подтверждён пользователем',
+                                     'mail.opt_out_confirmed')
+
+    @staticmethod
+    def _possible_opt_out(message, body):
+        subject = re.sub(r'^(?:(?:re|fw|fwd|ответ):\s*)+', '', str(message.get('Subject', '')).strip(), flags=re.I)
+        # Stop at usual quote boundaries so our own footer cannot flag a reply.
+        reply = re.split(r'(?im)^\s*(?:>|--\s*$|on .{1,250} wrote:\s*$|.{1,250}(?:написал[аи]?|пишет):\s*$)',
+                         body[:4000], maxsplit=1)[0]
+        return bool(_OPT_OUT_REQUEST.search(subject) or _OPT_OUT_REQUEST.search(reply))
+
+    def sync(self, cancel=None):
+        with self._lock, self._cancellable(cancel):
             account, password = self._account(require_connected=True)
             sent_warning = ''
             try:
@@ -596,10 +951,11 @@ class MailService:
             except SentReconciliationError as exc:
                 sent_warning = f'{exc} Неясные отправки сохранены.'
             connection = None
-            matched = 0
+            matched = unsubscribed = possible = 0
             try:
                 connection = self._imap(account, password)
                 status, _ = connection.select('INBOX', readonly=True)
+                self._check_cancelled()
                 if status != 'OK':
                     raise RuntimeError('Входящие письма недоступны.')
                 validity_data = connection.response('UIDVALIDITY')[1] or [b'']
@@ -626,12 +982,15 @@ class MailService:
                     # IMAP requires English month names regardless of LC_TIME.
                     criteria = ('SINCE', f'{since.day:02d}-{_IMAP_MONTHS[since.month - 1]}-{since.year:04d}')
                 state, result = connection.uid('search', None, *criteria)
+                self._check_cancelled()
                 if state != 'OK' or not result or (result[0] is not None and not isinstance(result[0], bytes)):
                     raise RuntimeError('Не удалось получить новые письма.')
                 uids = sorted({int(x) for x in (result[0] or b'').split() if x.isdigit() and int(x) > last_uid})[:100]
                 for uid in uids:
                     # Fetch size first, then a bounded body. Never set Seen.
+                    self._check_cancelled()
                     state, size_data = connection.uid('fetch', str(uid), '(RFC822.SIZE)')
+                    self._check_cancelled()
                     size_blob = b' '.join(item for item in size_data or [] if isinstance(item, bytes))
                     sizes = re.findall(rb'RFC822.SIZE (\d+)', size_blob)
                     if state != 'OK' or not sizes:
@@ -641,6 +1000,7 @@ class MailService:
                         state, data = connection.uid('fetch', str(uid), '(BODY.PEEK[HEADER]<0.262144>)')
                     else:
                         state, data = connection.uid('fetch', str(uid), '(BODY.PEEK[]<0.' + str(MAX_MESSAGE_BYTES) + '>)')
+                    self._check_cancelled()
                     if state != 'OK':
                         raise RuntimeError('Не удалось прочитать письмо. Проверка продолжится с него при следующем обновлении.')
                     raw = next((item[1] for item in data or [] if isinstance(item, tuple)), None)
@@ -654,29 +1014,43 @@ class MailService:
                         message = email.message_from_bytes(raw, policy=policy.default)
                         source = self._match_reply(message, account)
                         message_id = str(message.get('Message-ID', '')).strip()
+                        if message_id and len(message_id) < 500:
+                            unsubscribed += self._automatic_opt_out(message, account, message_id)
                         if source and message_id and len(message_id) < 500:
-                            auto = is_automatic(message)
+                            auto = is_automatic(message, matched_reply=True)
                             try:
                                 sent_at = parsedate_to_datetime(str(message.get('Date', ''))).astimezone(timezone.utc).isoformat()
                             except (TypeError, ValueError, OverflowError):
                                 sent_at = now()
-                            exists = self.store.one('SELECT id FROM mail_messages WHERE message_id=?', (message_id,))
-                            self.store.execute('INSERT OR IGNORE INTO mail_messages(product_id,company_id,message_id,in_reply_to,refs,direction,sender,recipient,subject,body,sent_at,is_reply) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
-                                               (source['product_id'], source['company_id'], message_id, str(message.get('In-Reply-To', '')),
-                                                str(message.get('References', '')), 'incoming', parseaddr(str(message.get('From', '')))[1].casefold(),
-                                                account['email'], str(message.get('Subject', ''))[:500],
-                                                'Текст не загружен: письмо больше 2 МБ.' if large else message_text(message), sent_at, int(not auto)))
-                            if not auto and not exists:
-                                matched += 1
+                            peer = normalize_email(parseaddr(str(message.get('From', '')))[1])
+                            body = 'Текст не загружен: письмо больше 2 МБ.' if large else message_text(message)
+                            review = (not auto and self._possible_opt_out(message, body)
+                                      and not self.store.one('SELECT email FROM opt_out WHERE lower(email)=?', (peer,)))
+                            self._check_cancelled()
+                            with self.store.db as db:
+                                inserted = db.execute('INSERT OR IGNORE INTO mail_messages(product_id,company_id,message_id,in_reply_to,refs,direction,sender,recipient,subject,body,sent_at,is_reply,opt_out_review) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                                    (source['product_id'], source['company_id'], message_id, str(message.get('In-Reply-To', '')),
+                                     str(message.get('References', '')), 'incoming', peer, account['email'],
+                                     str(message.get('Subject', ''))[:500], body, sent_at, int(not auto), int(review)))
+                            if inserted.rowcount:
+                                matched += not auto
+                                possible += review
                     # Commit checkpoint only after successful processing.
+                    self._check_cancelled()
                     self.store.execute('UPDATE mail_accounts SET last_uid=?,uidvalidity=?,updated_at=? WHERE id=1',
                                        (uid, validity, now()))
                 if not uids:
+                    self._check_cancelled()
                     self.store.execute('UPDATE mail_accounts SET last_uid=?,uidvalidity=?,updated_at=? WHERE id=1',
                                        (last_uid, validity, now()))
                 result = f'Новых ответов: {matched}' if matched else 'Почта обновлена'
+                if unsubscribed:
+                    result += f'. Отказов от писем: {unsubscribed}'
+                if possible:
+                    result += f'. Запросов на отписку для проверки: {possible}'
                 return f'{result}. {sent_warning}' if sent_warning else result
             except (imaplib.IMAP4.error, OSError) as exc:
+                self._check_cancelled()
                 raise RuntimeError('Не удалось обновить почту. Проверьте соединение.') from exc
             finally:
                 self._close_imap(connection)

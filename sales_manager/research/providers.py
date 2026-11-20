@@ -1,8 +1,10 @@
 """Bounded source adapters. Search output is evidence, never invented demand."""
+import atexit
 import json
 import math
 import re
 import ssl
+import threading
 import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -22,6 +24,9 @@ KEYLESS_PROVIDERS = {'overpass': 'OpenStreetMap / Overpass', 'gdelt': 'GDELT',
                      'comtrade': 'UN Comtrade — импорт товаров'}
 NO_SOURCES_MESSAGE = ('Нет доступных источников поиска. Включите хотя бы один открытый источник в настройках')
 OVERPASS_URL = 'https://maps.mail.ru/osm/tools/overpass/api/interpreter'
+OVERPASS_ENDPOINTS = (OVERPASS_URL, 'https://overpass-api.de/api/interpreter',
+                      'https://overpass.private.coffee/api/interpreter')
+OVERPASS_HOSTS = frozenset(urlsplit(url).hostname for url in OVERPASS_ENDPOINTS)
 
 class ProviderError(RuntimeError):
     status = 'Недоступен'
@@ -108,33 +113,56 @@ class SearchResult:
     def to_dict(self):
         return asdict(self)
 
-def json_http(method, url, **kwargs):
-    """Only fixed provider endpoints are passed here; page URLs use SafeFetcher."""
-    try:
+_http_client = None
+_http_client_lock = threading.Lock()
+
+
+def _provider_client():
+    global _http_client
+    with _http_client_lock:
+        if _http_client is not None:
+            return _http_client
         try:
             import truststore
             context = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         except ImportError:
             context = ssl.create_default_context()
-        with httpx.Client(timeout=httpx.Timeout(30, connect=10), follow_redirects=False,
-                          verify=context, trust_env=False, headers={'User-Agent': USER_AGENT}) as client:
-            with client.stream(method, url, **kwargs) as response:
-                data = bytearray()
-                for chunk in response.iter_bytes():
-                    data.extend(chunk)
-                    if len(data) > 6_000_000:
-                        raise ProviderError('Ответ источника превышает допустимый размер.')
-                try:
-                    value = json.loads(data)
-                except (ValueError, UnicodeError) as exc:
-                    check_response(response.status_code, {}, response.headers)
-                    raise InvalidResponseError('Источник вернул некорректный JSON; данные не добавлены.') from exc
-                if response.status_code in (401, 403) and url.startswith('https://api.firecrawl.dev/') and not kwargs.get('headers', {}).get('Authorization'):
-                    raise MissingKeyError('Firecrawl не разрешает поиск без ключа с этого IP. Используйте другие открытые источники.')
-                check_response(response.status_code, value, response.headers)
-                if not isinstance(value, dict):
-                    raise InvalidResponseError('Неожиданный формат ответа источника.')
-                return value
+        _http_client = httpx.Client(timeout=httpx.Timeout(30, connect=10, pool=5),
+                                   limits=httpx.Limits(max_connections=8, max_keepalive_connections=8),
+                                   follow_redirects=False, verify=context, trust_env=False,
+                                   headers={'User-Agent': USER_AGENT})
+        return _http_client
+
+
+@atexit.register
+def close_provider_http():
+    global _http_client
+    with _http_client_lock:
+        if _http_client is not None:
+            _http_client.close()
+            _http_client = None
+
+
+def json_http(method, url, **kwargs):
+    """Only fixed provider endpoints are passed here; page URLs use SafeFetcher."""
+    try:
+        with _provider_client().stream(method, url, **kwargs) as response:
+            data = bytearray()
+            for chunk in response.iter_bytes():
+                data.extend(chunk)
+                if len(data) > 6_000_000:
+                    raise ProviderError('Ответ источника превышает допустимый размер.')
+            try:
+                value = json.loads(data)
+            except (ValueError, UnicodeError) as exc:
+                check_response(response.status_code, {}, response.headers)
+                raise InvalidResponseError('Источник вернул некорректный JSON; данные не добавлены.') from exc
+            if response.status_code in (401, 403) and url.startswith('https://api.firecrawl.dev/') and not kwargs.get('headers', {}).get('Authorization'):
+                raise MissingKeyError('Firecrawl не разрешает поиск без ключа с этого IP. Используйте другие открытые источники.')
+            check_response(response.status_code, value, response.headers)
+            if not isinstance(value, dict):
+                raise InvalidResponseError('Неожиданный формат ответа источника.')
+            return value
     except httpx.HTTPError as exc:
         raise TransientProviderError('Источник временно недоступен или не прошёл проверку TLS.') from exc
 
@@ -216,24 +244,34 @@ class GDELTProvider:
     def __init__(self, request=json_http):
         self.request = request
 
-    def search(self, query, country, limit=10):
-        # GDELT indexes news. Mentions are never interpreted as sales volume.
-        from .normalization import clean_text, normalize_product
+    @classmethod
+    def topic_for(cls, query):
+        from .normalization import clean_text, normalize_product, product_candidates
         original = clean_text(query)
-        topic = next((words for category, words in self.TOPICS.items()
-                      if original.startswith(category)), None)
-        if topic is None:
-            try:
-                topic = self.GOODS.get(normalize_product(query))
-            except ValueError:
-                topic = None
-        if topic:
-            query = '(' + topic + ') (demand OR sales OR purchases OR orders) sourcelang:russian'
-        else:
-            # Unknown user goods retain their own words, without inventing a
-            # translation or narrowing the news to the publisher's country.
-            query = re.sub(r'["(){}\[\]:]', ' ', query)[:180]
-            query += ' sourcelang:russian'
+        for category, words in cls.TOPICS.items():
+            if original == category or original.startswith(category + ' '):
+                return words
+        if not original:
+            return ''
+        try:
+            if topic := cls.GOODS.get(normalize_product(query)):
+                return topic
+        except ValueError:
+            pass
+        candidates = product_candidates(original)
+        known = [word for product, word in cls.GOODS.items() if product in candidates]
+        if len(known) == 1:
+            return known[0]
+        if re.fullmatch(r'[a-z0-9 -]{3,100}', original) and re.search(r'[a-z]{3}', original):
+            return '"' + original + '"'
+        return ''
+
+    def search(self, query, country, limit=10):
+        # The DOC index searches English translations, also for Russian outlets.
+        topic = self.topic_for(query)
+        if not topic:
+            return []
+        query = '(' + topic + ') (demand OR sales OR purchases OR orders) sourcelang:russian'
         data = self.request('GET', 'https://api.gdeltproject.org/api/v2/doc/doc',
                             params={'query': query, 'mode': 'ArtList', 'format': 'json',
                                     'timespan': '3months', 'maxrecords': min(limit, 30), 'sort': 'DateDesc'})
@@ -246,6 +284,7 @@ class OverpassProvider:
 
     def __init__(self, request=json_http):
         self.request = request
+        self._retry_at = {}
 
     def search(self, query, country, limit=10):
         filters = osm_filters(query)
@@ -258,11 +297,25 @@ class OverpassProvider:
         statement = (f'[out:json][timeout:20][maxsize:134217728];'
                      f'area["ISO3166-1"="{code}"]["admin_level"="2"]->.a;'
                      f'({choices});out tags {min(limit, 30)};')
-        data = self.request('POST', OVERPASS_URL, data={'data': statement})
-        if data.get('remark'):
-            raise ProviderError('Overpass прервал исследование: сервер перегружен или превышен лимит.')
+        error = None
+        for endpoint in OVERPASS_ENDPOINTS:
+            if self._retry_at.get(endpoint, 0) > time.monotonic():
+                continue
+            try:
+                data = self.request('POST', endpoint, data={'data': statement})
+                if data.get('remark'):
+                    raise TransientProviderError('Overpass прервал исследование: сервер перегружен или превышен лимит.')
+                elements = rows(data, 'elements')
+                break
+            except ProviderError as exc:
+                error = exc
+                self._retry_at[endpoint] = time.monotonic() + max(2, exc.retry_after)
+        else:
+            if error is not None:
+                raise error
+            raise RateLimitError('Зеркала Overpass временно недоступны.')
         results = []
-        for row in rows(data, 'elements'):
+        for row in elements:
             tags = row.get('tags', {})
             if not tags.get('name'):
                 continue
@@ -497,12 +550,14 @@ class RSSProvider:
         for label, products in CATEGORIES.items():
             if category == label or (len(category) >= 5 and category in label):
                 wanted.update(products)
+        normalized_wanted = {normalize_product(product) for product in wanted}
         words = [w[:max(4, len(w)-2)] for w in re.findall(r'[а-яёa-z]{4,}', query.casefold())
                  if w not in ('россия', 'контакты', 'компании', 'официальный', 'спрос', 'рынок', 'новости', 'отчет', 'сайт')]
         output = []
         for item in self.discover(country, limit=1600):
             text = (item.title + ' ' + item.snippet).casefold()
-            relevant = any(normalize_product(p) in product_candidates(text) for p in wanted) if wanted else any(w in text for w in words)
+            relevant = (not normalized_wanted.isdisjoint(product_candidates(text)) if normalized_wanted
+                        else any(word in text for word in words))
             if relevant:
                 output.append(item)
         return output[:limit]

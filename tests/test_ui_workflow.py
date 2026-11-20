@@ -29,6 +29,12 @@ class StubService:
     def __init__(self, *args):
         pass
 
+    def close(self):
+        pass
+
+    def pending_opt_outs(self):
+        return []
+
 
 @pytest.fixture
 def window(qtbot, tmp_path, monkeypatch):
@@ -41,6 +47,7 @@ def window(qtbot, tmp_path, monkeypatch):
     view.startup_mail_timer.stop()
     qtbot.addWidget(view)
     view.show()
+    qtbot.waitUntil(lambda: not view.workers, timeout=5000)
     yield view
     qtbot.waitUntil(lambda: not view.workers, timeout=5000)
     view.close()
@@ -76,7 +83,7 @@ def test_three_tabs_and_independent_product_branches(window):
     assert len(window.company_rows) == 1
 
 
-def test_import_statistics_dialog_is_separate_and_shows_period(window, monkeypatch):
+def test_import_statistics_dialog_is_separate_and_shows_period(window, monkeypatch, qtbot):
     from sales_manager.research.providers import ComtradeProvider
     from sales_manager.research.service import ResearchService
     year = '2020'
@@ -96,6 +103,7 @@ def test_import_statistics_dialog_is_separate_and_shows_period(window, monkeypat
     monkeypatch.setattr(app, 'SourcesDialog', Dialog)
     window.countries = ['Россия']
     window.refresh_market()
+    qtbot.waitUntil(lambda: not window.workers)
     assert window.market_rows == []
     window.show_import_statistics()
     assert captured['shown'] and 'отдельная статистика' in captured['title']
@@ -168,6 +176,7 @@ def test_market_selection_opens_branch_without_search(window, qtbot, monkeypatch
     product = window.store.ensure_product('Картон')
     monkeypatch.setattr(app, 'market_ranking', lambda *args: {'rows': [dict(id=product['id'], name='Картон', basis='Продажи: 100 шт. · 2026-11 · Россия', count=2, source_ids=[1, 2])], 'preliminary': False})
     window.refresh_market()
+    qtbot.waitUntil(lambda: window.market_table.rowCount() == 1)
     calls = []
     monkeypatch.setattr(window, 'start_companies', lambda: calls.append(window.product_id))
     rect = window.market_table.visualItemRect(window.market_table.item(0, 0))
@@ -178,10 +187,11 @@ def test_market_selection_opens_branch_without_search(window, qtbot, monkeypatch
     assert window.store.get_setting('product.branches') == [product['id']]
 
 
-def test_market_demand_percentage_colors_are_subtle_and_unknown_uncolored(window, monkeypatch):
+def test_market_demand_percentage_colors_are_subtle_and_unknown_uncolored(window, monkeypatch, qtbot):
     rows = [dict(id=i, name=str(i), basis='факт', demand_percent=value) for i, value in enumerate((0, 50, 100, None), 1)]
     monkeypatch.setattr(app, 'market_ranking', lambda *args: {'rows': rows, 'preliminary': True})
     window.refresh_market()
+    qtbot.waitUntil(lambda: window.market_table.rowCount() == 4)
     cells = [window.market_table.item(i, 1) for i in range(4)]
     assert [cell.text() for cell in cells] == ['0%', '50%', '100%', 'факт']
     low, mid, high = [cell.background().color() for cell in cells[:3]]
@@ -191,10 +201,11 @@ def test_market_demand_percentage_colors_are_subtle_and_unknown_uncolored(window
     assert cells[3].background().style() == Qt.BrushStyle.NoBrush
 
 
-def test_demand_badges_are_actually_painted_in_dark_theme(window, monkeypatch):
+def test_demand_badges_are_actually_painted_in_dark_theme(window, monkeypatch, qtbot):
     rows = [dict(id=i, name=str(i), basis='факт', demand_percent=value) for i, value in enumerate((0, 100), 1)]
     monkeypatch.setattr(app, 'market_ranking', lambda *args: {'rows': rows, 'preliminary': True})
     window.refresh_market()
+    qtbot.waitUntil(lambda: window.market_table.rowCount() == 2)
     app.QApplication.processEvents()
     viewport = window.market_table.viewport()
     pixmap = viewport.grab()
@@ -224,10 +235,12 @@ def test_market_sources_button_opens_its_product_without_selecting_another(windo
             return 0
     monkeypatch.setattr(app, 'SourcesDialog', SourcePreview)
     window.refresh_market()
+    qtbot.waitUntil(lambda: window.market_table.rowCount() == 1)
     assert [window.market_table.horizontalHeaderItem(i).text() for i in range(3)] == ['Товар', 'Спрос', 'Источники']
     control = window.market_table.cellWidget(0, 2)
     assert control.text() == 'Источники · 2'
     qtbot.mouseClick(control, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(lambda: shown == [1, 2])
     assert shown == [1, 2]
     assert calls == [(product['id'], window.countries)]
     assert window.tabs.currentIndex() == 0
@@ -238,6 +251,7 @@ def test_market_enter_opens_selected_branch_and_source_dialog_selects_real_fact(
     product = window.store.ensure_product('Кофе')
     monkeypatch.setattr(app, 'market_ranking', lambda *args: {'rows': [dict(id=product['id'], name='Кофе', basis='Продажи: 100 шт. · 2026-11 · Россия', count=2)], 'preliminary': False})
     window.refresh_market()
+    qtbot.waitUntil(lambda: not window.workers)
     window.market_table.setCurrentCell(0, 1)
     qtbot.keyClick(window.market_table, Qt.Key.Key_Return)
     assert window.product_id == product['id']
@@ -269,7 +283,7 @@ def test_phone_only_and_manual_missing_contacts_remain_visible(window, qtbot):
     company(window.store, product_id, name='Ручная карточка', email='', phone='', manual=1)
     company(window.store, product_id, name='Без контактов', email='', phone='')
     window.open_product(product_id)
-    assert {r['name'] for r in window.company_rows} == {'Только телефон', 'Ручная карточка'}
+    assert {r['name'] for r in window.company_rows} == {'Только телефон', 'Ручная карточка', 'Без контактов'}
     for row in range(window.company_table.rowCount()):
         assert window.company_table.item(row, 3).text() == 'Нет email'
     index = next(i for i, row in enumerate(window.company_rows) if row['name'] == 'Только телефон')
@@ -298,6 +312,7 @@ def test_table_controls_fit_full_labels_inside_cells_at_minimum_window(window, q
     monkeypatch.setattr(app, 'market_ranking', lambda *args: {'rows': [dict(id=product['id'], name='Офисные кресла', basis='Продажи: 100 шт. · Россия', count=2)], 'preliminary': False})
     window.resize(1020, 680)
     window.refresh_market()
+    qtbot.waitUntil(lambda: window.market_table.rowCount() == 1)
     app.QApplication.processEvents()
     def full_label_fits(table, column):
         control = table.cellWidget(0, column)
@@ -439,7 +454,7 @@ def test_worker_network_function_runs_outside_ui_and_callback_on_ui(window, qtbo
     assert observed['callback'] == main_thread
 
 
-def test_market_country_filter_and_stale_evidence(window):
+def test_market_country_filter_and_stale_evidence(window, qtbot):
     from sales_manager.research.market import extract_observations
     for country, name, date in [('Россия', 'Картон', now()), ('Казахстан', 'Древесина', now()), ('Россия', 'Старая тенденция', '2020-01-01T00:00:00+00:00')]:
         product_id = window.store.ensure_product(name)['id']
@@ -451,6 +466,7 @@ def test_market_country_filter_and_stale_evidence(window):
                                  (product_id, source_id, item['metric'], item['value'], item['unit'], item['period'], item['country'], item['published_at'], item['excerpt'], int(item['measured']), item['event_key'], date))
     window.countries = ['Россия']
     window.refresh_market()
+    qtbot.waitUntil(lambda: not window.workers)
     assert [row['name'] for row in window.market_rows] == ['Картон']
 
 
@@ -840,7 +856,7 @@ def test_rejected_submit_releases_send_dialog_lock(window, qtbot, monkeypatch):
     dialog.close()
 
 
-def test_market_publication_caption_does_not_claim_sales(window):
+def test_market_publication_caption_does_not_claim_sales(window, qtbot):
     from sales_manager.research.market import extract_observations
     product = window.store.ensure_product('Кофе')['id']
     date = now()
@@ -852,8 +868,11 @@ def test_market_publication_caption_does_not_claim_sales(window):
                              (product, source, item['metric'], item['value'], item['unit'], item['period'], item['country'], item['published_at'], item['excerpt'], int(item['measured']), item['event_key'], date))
     window.countries = ['Россия']
     window.refresh_market()
+    qtbot.waitUntil(lambda: not window.workers)
     assert window.market_rows[0]['id'] == product
     assert 'По данным публикаций' in window.market_hint.text()
+    assert 'с 2025 года по настоящее время' in window.market_hint.text()
+    assert 'Последняя публикация ' + '.'.join(reversed(date[:10].split('-'))) in window.market_hint.text()
     assert not window.market_rows[0]['measured']
 
 
@@ -867,6 +886,81 @@ def test_close_cancels_delayed_startup_mail_check(window, monkeypatch, qtbot):
     assert not calls
     assert not window.workers
     assert not window.startup_mail_timer.isActive()
+
+
+def test_startup_mail_waits_for_foreground_maintenance(window, monkeypatch, qtbot):
+    gate = threading.Event()
+    calls = []
+    monkeypatch.setattr(window, 'sync_mail', lambda: calls.append('sync'))
+    window.submit(lambda emit: gate.wait(3), busy_message='Обслуживаем базу данных')
+    try:
+        window.sync_startup_mail()
+        assert window.startup_mail_timer.isActive()
+        assert calls == []
+    finally:
+        gate.set()
+    qtbot.waitUntil(lambda: calls == ['sync'], timeout=2500)
+
+
+def test_close_cancels_active_mail_worker(window, monkeypatch, qtbot):
+    window.store.execute("INSERT INTO mail_accounts(id,email,connected) VALUES(1,'owner@example.org',1)")
+    started = threading.Event()
+    socket_cancellation = []
+
+    def sync(cancel):
+        assert cancel is window.mail_cancel
+        started.set()
+        cancel.wait(5)
+        return 'Почта обновлена'
+
+    monkeypatch.setattr(window.mail, 'sync', sync, raising=False)
+    monkeypatch.setattr(window.mail, 'cancel_network',
+                        lambda: socket_cancellation.append(window.mail_cancel.is_set()), raising=False)
+    window.sync_mail(manual=True)
+    qtbot.waitUntil(started.is_set)
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible(), timeout=2000)
+    assert socket_cancellation == [True]
+    assert not window.workers
+
+
+def test_sent_folder_picker_persists_selected_wire_name(window, monkeypatch, qtbot):
+    window.store.execute("INSERT INTO mail_accounts(id,email,connected,sent_folder) VALUES(1,'owner@example.org',1,'Sent')")
+    folders = [('Автоматически', ''), ('Отправленные', 'Sent'), ('Автоматически', 'Custom')]
+    monkeypatch.setattr(window.mail, 'list_folders', lambda cancel: folders, raising=False)
+    monkeypatch.setattr(window.mail, 'set_sent_folder',
+                        lambda wire: window.store.execute('UPDATE mail_accounts SET sent_folder=?', (wire,)), raising=False)
+
+    def choose(_parent, _title, _label, choices, current, editable):
+        assert current == 1 and not editable
+        assert len(set(choices)) == len(choices)
+        return choices[-1], True
+
+    monkeypatch.setattr(app.QInputDialog, 'getItem', choose)
+    window.choose_sent_folder()
+    qtbot.waitUntil(lambda: not window.workers)
+    assert window.store.one('SELECT sent_folder FROM mail_accounts')['sent_folder'] == 'Custom'
+
+
+def test_offer_numeric_warning_is_visible_and_rechecked_after_edit(window, qtbot):
+    from sales_manager.ai import AIService
+
+    pid = window.store.ensure_product('Картон')['id']
+    cid = company(window.store, pid)
+    row = window.store.one('SELECT source_ids FROM company_fit WHERE company_id=?', (cid,))
+    oid = offer(window.store, pid, cid, 'Выручка выросла до 3 млн рублей <b>за квартал</b>.')
+    window.store.execute("UPDATE offers SET cache_key='generated',source_ids=? WHERE id=?", (row['source_ids'], oid))
+    window.ai = AIService(window.store, window.secrets)
+    window.open_product(pid)
+    dialog = OfferDialog(window, cid)
+    qtbot.addWidget(dialog)
+    dialog.show()
+    assert dialog.numeric_notice.isVisible()
+    assert '3 млн рублей' in dialog.numeric_notice.text()
+    assert '&lt;b&gt;' in dialog.numeric_notice.toolTip()
+    dialog.body.setPlainText('Предлагаем созвониться через 3 дня.')
+    qtbot.waitUntil(dialog.numeric_notice.isHidden)
+    dialog.close()
 
 
 def test_invalid_rss_url_never_partially_saves_other_settings(window, monkeypatch):
@@ -936,10 +1030,12 @@ def test_async_mail_error_is_visible_and_connect_button_becomes_reusable(window,
     previous = window.store.one('SELECT * FROM mail_accounts')
     window.mail_password.setText('isolated-app-password')
     gate = threading.Event()
-    def failed_connection(values, password):
+    from sales_manager.mail.service import MailAuthenticationError
+
+    def failed_connection(values, password, cancel):
         assert values[0] == 'owner@gmail.com' and password == 'isolated-app-password'
         gate.wait(1)
-        raise ValueError('Gmail: неверный пароль приложения. Проверьте настройки.')
+        raise MailAuthenticationError('Gmail: неверный пароль приложения. Проверьте настройки.')
     monkeypatch.setattr(window.mail, 'verify_connection', failed_connection, raising=False)
     window.test_mail()
     assert window.mail_busy
