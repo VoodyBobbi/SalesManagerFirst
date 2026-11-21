@@ -200,32 +200,12 @@ class CompanyDialog(QDialog):
                     details.append('Деятельность: ' + str(activity.get('label', '')))
                     if activity.get('quote'):
                         details.append('Факт: «' + str(activity['quote']) + '»')
-        contacts = store.query('SELECT c.kind,c.value,c.checked_at,c.source_id,s.title AS source_title '
-                               'FROM company_contacts c LEFT JOIN sources s ON s.id=c.source_id '
-                               'WHERE c.company_id=? ORDER BY c.kind,c.id', (company_id,))
-        contacts = [row for row in contacts if row['kind'] != 'email' or is_contact_email(row['value'])]
-        details.append('\nКонтакты')
-        details.extend(f"{row['value']} · {str(row['checked_at'] or '')[:10]}"
-                       f" · {'добавлен вручную' if str(row.get('source_title') or '').startswith('Ручной источник') else 'источник не указан' if not row.get('source_id') else 'источник указан'}"
-                       for row in contacts)
-        if not contacts:
-            details.append('Контакты не найдены.')
+        self._company_details = details
+        self._contact_details_start = len(details)
+        self._saved_details = '\n'.join(details)
         self.add_contact = QPushButton('Добавить контакт с источником')
         self.add_contact.clicked.connect(self.add_manual_contact)
         layout.addWidget(self.add_contact)
-        try:
-            ids = [int(value) for value in json.loads(fit.get('source_ids') or '[]')]
-        except (ValueError, TypeError):
-            ids = []
-        ids.extend(row['source_id'] for row in store.query('SELECT source_id FROM company_contacts WHERE company_id=? AND source_id IS NOT NULL', (company_id,)))
-        self.sources = []
-        for source_id in dict.fromkeys(ids):
-            source = store.one('SELECT * FROM sources WHERE id=?', (source_id,))
-            if source:
-                self.sources.append(source)
-                details.append(f"\n{source['title']}\n{source['url']}\nПроверено: {source['fetched_at'][:10]}\n{source['text'][:1500]}")
-        self._company_details = details
-        self._saved_details = '\n'.join(details)
         text = QPlainTextEdit(self._saved_details)
         self._fit_text = text
         text.setReadOnly(True)
@@ -298,16 +278,14 @@ class CompanyDialog(QDialog):
                               company_id=company_id)
             assess.clicked.connect(evaluate)
             layout.addWidget(assess)
-        if self.sources:
-            row = QHBoxLayout()
-            source_choice = QComboBox()
-            for source in self.sources:
-                source_choice.addItem(source['title'][:65] or source['url'], source['url'])
-            source_button = QPushButton('Источник')
-            source_button.clicked.connect(lambda: open_site(source_choice.currentData()))
-            row.addWidget(source_choice, 1)
-            row.addWidget(source_button)
-            layout.addLayout(row)
+        row = QHBoxLayout()
+        self._source_choice = QComboBox()
+        self._source_button = QPushButton('Источник')
+        self._source_button.clicked.connect(lambda: open_site(self._source_choice.currentData()))
+        row.addWidget(self._source_choice, 1)
+        row.addWidget(self._source_button)
+        layout.addLayout(row)
+        self._refresh_contact_details()
         layout.addWidget(label('Разрешение на контакт'))
         form = QFormLayout()
         self.email = QComboBox()
@@ -339,6 +317,41 @@ class CompanyDialog(QDialog):
         self.permission_save.setEnabled(self.email.count() > 0)
         layout.addWidget(buttons)
 
+    def _refresh_contact_details(self):
+        store, company_id = self.store, self.company_id
+        fit = store.one('SELECT source_ids FROM company_fit WHERE product_id=? AND company_id=?',
+                        (self.product_id, company_id)) or {}
+        details = self._company_details[:self._contact_details_start]
+        contacts = store.query('SELECT c.kind,c.value,c.checked_at,c.source_id,s.title AS source_title '
+                               'FROM company_contacts c LEFT JOIN sources s ON s.id=c.source_id '
+                               'WHERE c.company_id=? ORDER BY c.kind,c.id', (company_id,))
+        contacts = [row for row in contacts if row['kind'] != 'email' or is_contact_email(row['value'])]
+        details.append('\nКонтакты')
+        details.extend(f"{row['value']} · {str(row['checked_at'] or '')[:10]}"
+                       f" · {'добавлен вручную' if str(row.get('source_title') or '').startswith('Ручной источник') else 'источник не указан' if not row.get('source_id') else 'источник указан'}"
+                       for row in contacts)
+        if not contacts:
+            details.append('Контакты не найдены.')
+        try:
+            ids = [int(value) for value in json.loads(fit.get('source_ids') or '[]')]
+        except (ValueError, TypeError):
+            ids = []
+        ids.extend(row['source_id'] for row in store.query('SELECT source_id FROM company_contacts WHERE company_id=? AND source_id IS NOT NULL', (company_id,)))
+        self.sources = []
+        for source_id in dict.fromkeys(ids):
+            source = store.one('SELECT * FROM sources WHERE id=?', (source_id,))
+            if source:
+                self.sources.append(source)
+                details.append(f"\n{source['title']}\n{source['url']}\nПроверено: {source['fetched_at'][:10]}\n{source['text'][:1500]}")
+        self._company_details = details
+        self._saved_details = '\n'.join(details)
+        self._source_choice.clear()
+        for source in self.sources:
+            self._source_choice.addItem(source['title'][:65] or source['url'], source['url'])
+        self._source_choice.setVisible(bool(self.sources))
+        self._source_button.setVisible(bool(self.sources))
+        self._fit_text.setPlainText(self._saved_details)
+
     def add_manual_contact(self):
         dialog = ManualContactDialog(self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -364,6 +377,7 @@ class CompanyDialog(QDialog):
                            'VALUES(?,?,?,?,?,?) ON CONFLICT(company_id,kind,value) DO UPDATE SET '
                            'source_id=excluded.source_id,checked_at=excluded.checked_at,scope=excluded.scope',
                            (self.company_id, kind, value, source_id, now(), scope))
+        self._refresh_contact_details()
         previous = self.email.currentText()
         with QSignalBlocker(self.email):
             self.email.clear()
@@ -823,8 +837,12 @@ class OfferDialog(QDialog):
             self.notice.setText('Заполните тему и текст письма перед отправкой.')
             return
         permission = self.store.one('SELECT id FROM permissions WHERE company_id=? AND lower(email)=lower(?) AND basis<>\'\' AND evidence<>\'\' LIMIT 1', (self.company_id, self.recipient))
-        if not permission or self.store.one('SELECT email FROM opt_out WHERE lower(email)=lower(?)', (self.recipient,)):
-            self.notice.setText('В карточке компании укажите основание и подтверждение разрешения на контакт. При запрете отправка недоступна.')
+        if self.store.one('SELECT email FROM opt_out WHERE lower(email)=lower(?)', (self.recipient,)):
+            self.notice.setText('Отправка заблокирована: для этого адреса сохранён запрет на письма.')
+            self.permission_button.hide()
+            return
+        if not permission:
+            self.notice.setText('В карточке компании укажите основание и подтверждение разрешения на контакт.')
             self.permission_button.show()
             return
         self.permission_button.hide()

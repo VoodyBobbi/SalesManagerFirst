@@ -117,7 +117,7 @@ def parse_feed(xml, url, country=''):
     if tag(root) not in ('rss', 'feed', 'RDF'):
         raise InvalidResponseError('Источник не вернул RSS/Atom.')
     output = []
-    for entry in list(root.iter()):
+    for entry in root.iter():
         if tag(entry) not in ('item', 'entry'):
             continue
         fields = {tag(el): el for el in entry}
@@ -137,7 +137,7 @@ def parse_feed(xml, url, country=''):
         if not link.startswith(('https://', 'http://')):
             continue
         snippet = BeautifulSoup(value('description') or value('summary') or value('content'), 'html.parser').get_text(' ', strip=True)
-        published = value('pubDate') or value('published') or value('updated')
+        published = value('pubDate') or value('published') or value('updated') or value('date')
         if published:
             try:
                 published = parsedate_to_datetime(published).isoformat()
@@ -145,8 +145,6 @@ def parse_feed(xml, url, country=''):
                 pass
         output.append(SearchResult(link, value('title')[:300], snippet[:5000], country,
             published, {'provider': 'rss', 'feed_url': url}))
-        if len(output) >= 200:
-            break
     return output
 
 
@@ -185,13 +183,49 @@ def external_links(html, url, limit=10):
     return list(dict.fromkeys(output))[:limit]
 
 
+def _evidence_text(parts):
+    """Preserve email addresses split by inline markup and space other words."""
+    raw = ''.join(parts)
+    emails = iter(EMAIL_RE.finditer(raw))
+    email = next(emails, None)
+    output, offset = [], 0
+    for part in parts:
+        while email and email.end() <= offset:
+            email = next(emails, None)
+        if output and not (email and email.start() < offset < email.end()):
+            output.append(' ')
+        output.append(part)
+        offset += len(part)
+    return ''.join(output)
+
+
+def _evidence_label(block, root):
+    current = block
+    while current and current is not root and current.name not in HEADINGS:
+        previous = current.previous_sibling
+        while previous is not None:
+            if isinstance(previous, NavigableString) and not previous.strip():
+                previous = previous.previous_sibling
+                continue
+            if getattr(previous, 'name', None) in HEADINGS | {'div', 'dt', 'p'}:
+                label = previous.get_text(' ', strip=True)
+                if (len(label) <= 120 and not INN_RE.search(label) and not EMAIL_RE.search(label)
+                        and (LEGAL_PARTY_RE.search(label) or FOOTER_CONTACT_PARTY_RE.search(label))):
+                    return label
+            break
+        current = current.parent
+    return ''
+
+
 def _evidence_blocks(soup):
     """Keep contacts and identifiers with their enclosing HTML text, including link targets."""
     blocks = {}
     for node in soup.descendants:
         kind, value = 'text', ''
         if type(node) is NavigableString:
-            value = node.strip()
+            value = str(node)
+        elif node.name in ('br', 'hr'):
+            value = ' '
         elif node.name == 'a':
             href = str(node.get('href', '')).strip()
             if href.lower().startswith('mailto:'):
@@ -207,21 +241,9 @@ def _evidence_blocks(soup):
                     parts.append(('text', label))
             parts.append((kind, value))
     for block, parts in blocks.values():
-        label = ''
-        previous = block.previous_sibling if block and block.name not in HEADINGS else None
-        while previous and isinstance(previous, NavigableString) and not str(previous).strip():
-            previous = previous.previous_sibling
-        # A heading or short role label applies only to the next sibling block.
-        if previous and getattr(previous, 'name', None) in HEADINGS:
-            label = previous.get_text(' ', strip=True)
-        elif previous and getattr(previous, 'name', None) in ('div', 'dt', 'p'):
-            adjacent = previous.get_text(' ', strip=True)
-            if (len(adjacent) <= 120 and not INN_RE.search(adjacent) and not EMAIL_RE.search(adjacent)
-                    and (LEGAL_PARTY_RE.search(adjacent) or CONTACT_PARTY_RE.search(adjacent)
-                         or re.fullmatch(rf'(?:{DEVELOPER_CREDIT}|{DEVELOPER_LABEL})\s*[:—–-]?', adjacent, re.I))):
-                label = adjacent
+        label = _evidence_label(block, soup)
         if label:
-            parts.insert(0, ('text', label))
+            parts.insert(0, ('text', label + ' '))
         yield block, parts
 
 
@@ -269,7 +291,7 @@ def _page_contacts_and_legal_ids(soup, country, site_domain, qualified_only=Fals
         for kind, group in groupby(parts, key=lambda item: item[0]):
             values = [value for _, value in group]
             if kind == 'text':
-                text = ' '.join(values)
+                text = _evidence_text(values)
                 start = 0
                 for marker in contact_roles.finditer(text):
                     snippets[role].append(text[start:marker.start()])
@@ -359,6 +381,8 @@ def _branch_blocks(soup, site_domain, country):
     """Read explicit branch sections with their own location and contacts."""
     branches = []
     for block in soup.find_all(('article', 'section', 'div', 'li')):
+        if block.attrs is None:
+            continue  # A previously extracted branch contained this element.
         marker = ' '.join([str(block.get('id', '')), *block.get('class', [])])
         heading = block.find(('h2', 'h3', 'h4', 'h5'), recursive=False)
         title = heading.get_text(' ', strip=True) if heading else ''
@@ -391,6 +415,8 @@ def parse_page(html, url, country=''):
     title = soup.title.get_text(' ', strip=True)[:250] if soup.title else ''
     og = soup.find('meta', attrs={'property': 'og:site_name'})
     og_name = og.get('content') if og else ''
+    published = soup.find('meta', attrs={'property': 'article:published_time'}) or soup.find(attrs={'itemprop': 'datePublished'})
+    published_at = (published.get('content') or published.get('datetime') or published.get_text(strip=True)) if published else ''
     organization_name = (primary['name'] if primary else '') or _record_text(og_name)
     if not organization_name:
         organization_name = re.split(r'\s[|—–]\s', title)[0][:180] or domain_of(url)
@@ -427,7 +453,7 @@ def parse_page(html, url, country=''):
         location_phones = {value for branch in local_records for value in branch['phones']}
         emails = sorted((set(emails) - location_emails) | (set(primary['emails']) if primary else set()))
         phones = sorted((set(phones) - location_phones) | (set(primary['phones']) if primary else set()))
-    return {'url': url, 'title': title, 'name': organization_name, 'text': text,
+    return {'url': url, 'title': title, 'name': organization_name, 'text': text, 'published_at': published_at,
             'emails': emails, 'phones': phones, 'phone_values': phone_values, 'developer_emails': developer_emails,
             'excluded_emails': excluded_emails, 'organizations': records, 'branches': branches,
             'organization_text': _visible_text(soup),

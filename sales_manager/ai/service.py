@@ -7,6 +7,7 @@ import threading
 import time
 import uuid
 from datetime import date
+from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
@@ -35,6 +36,10 @@ OFFER_SCHEMA = {
 
 class PossiblyChargedError(RuntimeError):
     """Completion may have reached GigaChat, but response/usage was lost."""
+
+
+class GigaChatRateLimit(RuntimeError):
+    """The provider rejected the request before completion."""
 
 
 # Numerical claims must be grounded in source text, never in URL identifiers,
@@ -293,7 +298,14 @@ def _numeric_claims(text):
             lower = match['range_start'] or match['dash_start']
             upper = match['range_end'] or match['dash_end']
             amount = (_canonical_number(lower), _canonical_number(upper))
-        identity = (amount, _quantity_qualifier(text, end), _quantity_direction(text, start, end), precision)
+        magnitude, unit = _quantity_qualifier(text, end)
+        if magnitude and unit in ('rub', 'usd', 'eur') and not match['date']:
+            factor = {'thousand': 1000, 'million': 1000000, 'billion': 1000000000}[magnitude]
+            values = amount if isinstance(amount, tuple) else (amount,)
+            scaled = tuple(_canonical_number(format(Decimal(value) * factor, 'f')) for value in values)
+            amount = scaled if isinstance(amount, tuple) else scaled[0]
+            magnitude = ''
+        identity = (amount, (magnitude, unit), _quantity_direction(text, start, end), precision)
         yield identity, _number_context(text, start, end), match.span()
 
 
@@ -424,7 +436,7 @@ class AIService:
             if response.status_code in (401, 403):
                 raise RuntimeError('GigaChat: проверьте ключ и тип доступа.')
             if response.status_code == 429:
-                raise RuntimeError('GigaChat: лимит запросов. Повторите позже.')
+                raise GigaChatRateLimit('GigaChat: лимит запросов. Повторите позже.')
             if response.status_code >= 500 and path == '/chat/completions':
                 raise PossiblyChargedError('GigaChat: ошибка сервера после отправки. Расход токенов не подтверждён.')
             if response.status_code >= 400:
@@ -466,7 +478,7 @@ class AIService:
                 'Accept': 'application/json',
             }, data={'scope': scope})
             if response.status_code == 429:
-                raise RuntimeError('GigaChat: лимит запросов авторизации. Повторите позже.')
+                raise GigaChatRateLimit('GigaChat: лимит запросов авторизации. Повторите позже.')
             if response.status_code >= 500:
                 raise RuntimeError('GigaChat: ошибка сервера авторизации (' + str(response.status_code) + '). Повторите позже.')
             if response.status_code >= 400:
@@ -533,17 +545,21 @@ class AIService:
         except (ValueError, TypeError):
             profile = {}
         saved_quote = re.search(r' Основание: «(.+?)»\s*$', fit['reason'] or '', re.S)
-        for source_id in source_ids[:4]:
+        ranked_sources = []
+        for source_id in dict.fromkeys(source_ids):
             source = self.store.one('SELECT id,url,title,text FROM sources WHERE id=?', (source_id,))
             if source and source['text'].strip():
                 quote = next((fact.get('quote', '') for fact in profile.get('activities', [])
                               if fact.get('source_id') == source_id and fact.get('quote')), '')
-                if require_fit and saved_quote and saved_quote[1] in source['text']:
+                is_saved_evidence = bool(require_fit and saved_quote and saved_quote[1] in source['text'])
+                if is_saved_evidence:
                     quote = saved_quote[1]
                 position = source['text'].find(quote) if quote else -1
                 margin = min(150, max(0, 1200 - len(quote)))
                 start = max(0, position - margin) if position >= 0 else 0
-                sources.append({**source, 'text': source['text'][start:start + 1200]})
+                ranked_sources.append((0 if is_saved_evidence else 1 if position >= 0 else 2,
+                                       {**source, 'text': source['text'][start:start + 1200]}))
+        sources = [source for _, source in sorted(ranked_sources, key=lambda item: item[0])[:4]]
         if not sources:
             raise ValueError('Нет сохранённых подтверждений. Обновите исследование компании.')
         return {
@@ -581,7 +597,7 @@ class AIService:
             return urlunsplit((parts.scheme.casefold(), parts.netloc.casefold(), parts.path.rstrip('/'), parts.query, ''))
         known_urls = {source_url(source['url']) for source in used_sources}
         for url in re.findall(r'https?://[^\s<>«»]+', plain_content, flags=re.I):
-            if source_url(url.rstrip('.,)')) not in known_urls:
+            if source_url(url) not in known_urls and source_url(url.rstrip('.,)!?:;…]”"')) not in known_urls:
                 raise ValueError('УТП содержит неизвестную ссылку.')
         prohibited = (
             r'гарантиру(?:ем|ю)', r'в наличии', r'на нашем складе', r'скидк\w*',
@@ -846,7 +862,12 @@ class AIService:
                 'evidence_quote — точная короткая цитата из одного использованного источника. '
                 'source_ids — только идентификаторы источников этой цитаты. Верни JSON по схеме.'
             )
-            response = self._completion(model, system, payload, schema, 'fit')
+            try:
+                response = self._completion(model, system, payload, schema, 'fit')
+            except GigaChatRateLimit:
+                self.store.execute("UPDATE company_fit SET ai_checked_key='' WHERE product_id=? AND company_id=? AND ai_checked_key=?",
+                                   (product_id, company_id, attempt_key))
+                raise
             try:
                 choice = response['choices'][0]
                 if not isinstance(choice, dict):

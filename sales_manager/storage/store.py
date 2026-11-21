@@ -5,6 +5,7 @@ import os
 import re
 import sqlite3
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -54,7 +55,7 @@ ON CONFLICT(month,provider,operation) DO UPDATE SET
 """
 
 class Store:
-    def __init__(self, path=None):
+    def __init__(self, path=None, *, defer_legacy_review=False):
         if path is None:
             root = Path(os.environ.get('LOCALAPPDATA', str(Path.home()))) / 'Argon' / 'SalesManagerFirst'
             root.mkdir(parents=True, exist_ok=True)
@@ -67,6 +68,14 @@ class Store:
         self.execute("UPDATE job_runs SET status='interrupted',reason='interrupted',message='Поиск прерван закрытием приложения. Прогресс сохранён; исследование восстановится автоматически.' WHERE status='running'")
         self.execute("UPDATE job_queue SET status='pending' WHERE status='running'")
         self.execute("UPDATE outbound_attempts SET status='uncertain' WHERE status='sending'")
+        if not defer_legacy_review:
+            self.review_legacy_fit()
+
+    def legacy_review_pending(self):
+        return not all(self.get_setting(key, False) for key in
+                       ('fit.legacy_ai_reviewed_v4', 'fit.relationship_reviewed_v5'))
+
+    def review_legacy_fit(self):
         self._revalidate_legacy_ai_fit()
         self._revalidate_legacy_relationships()
 
@@ -195,15 +204,37 @@ class Store:
     def search_usage(self):
         return self.query("SELECT provider,SUM(calls) AS calls FROM usage_accounting WHERE provider<>'gigachat' GROUP BY provider")
 
-    def retention(self, *, startup=False):
+    def retention_due(self):
+        stamp = self.get_setting('maintenance.last_retention')
+        return not isinstance(stamp, (int, float)) or not 0 <= datetime.now(timezone.utc).timestamp() - stamp < 86400
+
+    @contextmanager
+    def _maintenance_connection(self, cancel):
+        db = self.db
+        if cancel is not None:
+            db.execute('PRAGMA busy_timeout=1000')
+            db.set_progress_handler(cancel.is_set, 1000)
+        try:
+            yield db
+        except sqlite3.OperationalError as exc:
+            code = getattr(exc, 'sqlite_errorcode', 0) & 255
+            if cancel is None or (not cancel.is_set() and code not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)):
+                raise
+        finally:
+            if cancel is not None:
+                db.set_progress_handler(None, 0)
+                db.execute('PRAGMA busy_timeout=30000')
+
+    def retention(self, *, startup=False, cancel=None):
         """Prune expendable data and reclaim pages between background jobs."""
-        with self._retention_lock:
+        with self._retention_lock, self._maintenance_connection(cancel) as db:
+            if cancel is not None and cancel.is_set():
+                return
             timestamp = datetime.now(timezone.utc)
-            last_run = self.get_setting('maintenance.last_retention') if startup else None
-            if isinstance(last_run, (int, float)) and 0 <= timestamp.timestamp() - last_run < 86400:
+            if startup and not self.retention_due():
                 return
             cutoff = (timestamp - timedelta(days=90)).isoformat()
-            with self.db as db:
+            with db:
                 db.execute('BEGIN IMMEDIATE')
                 if db.execute("SELECT 1 FROM job_runs WHERE status='running' LIMIT 1").fetchone():
                     return
@@ -232,8 +263,9 @@ class Store:
                     # SQLite needs one rebuild to add pointer maps to older files.
                     db.execute('VACUUM')
             db.execute('PRAGMA incremental_vacuum(2048)').fetchall()
-            db.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()
-            self.set_setting('maintenance.last_retention', timestamp.timestamp())
+            if (not db.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()[0]
+                    and (cancel is None or not cancel.is_set())):
+                self.set_setting('maintenance.last_retention', timestamp.timestamp())
 
     def get_setting(self, key, default=None):
         row = self.one('SELECT value FROM settings WHERE key=?', (key,))
@@ -293,6 +325,13 @@ class Store:
         digest = hashlib.sha256(text.encode('utf-8')).hexdigest()
         self.execute('INSERT OR IGNORE INTO sources(url,title,text,hash,fetched_at,published_at) VALUES(?,?,?,?,?,?)', (url, title, text, digest, now(), published_at))
         return self.one('SELECT id FROM sources WHERE url=? AND hash=?', (url, digest))['id']
+
+    def ensure_generic_product(self, name, normalized):
+        from sales_manager.research.normalization import branch_identity
+        existing = self.one('SELECT name FROM products WHERE normalized=?', (normalized,))
+        if existing and branch_identity(existing['name']) != normalized:
+            normalized = 'market:' + normalized
+        return self.ensure_product(name, normalized)
 
     def ensure_product(self, name, normalized=None):
         name = ' '.join(name.split()).strip()

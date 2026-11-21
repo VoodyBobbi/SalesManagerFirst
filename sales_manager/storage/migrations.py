@@ -60,15 +60,34 @@ SELECT id,source_id,excerpt,published_at FROM market_observations;
 CREATE INDEX market_observation_sources_source ON market_observation_sources(source_id);
 '''
 
+OUTBOUND_RESERVATION = '''
+CREATE INDEX IF NOT EXISTS outbound_active_offer ON outbound_attempts(offer_id)
+WHERE status IN ('sending','uncertain');
+CREATE TRIGGER IF NOT EXISTS outbound_active_insert BEFORE INSERT ON outbound_attempts
+WHEN NEW.status IN ('sending','uncertain') AND EXISTS (
+    SELECT 1 FROM outbound_attempts WHERE offer_id=NEW.offer_id AND status IN ('sending','uncertain')
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Offer already has an active delivery');
+END;
+CREATE TRIGGER IF NOT EXISTS outbound_active_update BEFORE UPDATE OF offer_id,status ON outbound_attempts
+WHEN NEW.status IN ('sending','uncertain')
+ AND (OLD.status NOT IN ('sending','uncertain') OR OLD.offer_id IS NOT NEW.offer_id)
+ AND EXISTS (
+    SELECT 1 FROM outbound_attempts WHERE offer_id=NEW.offer_id AND status IN ('sending','uncertain')
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Offer already has an active delivery');
+END;
+'''
+
 PREDICTABLE_ACTIONS = '''
 ALTER TABLE offers ADD COLUMN recipient TEXT NOT NULL DEFAULT '';
 ALTER TABLE job_runs ADD COLUMN reason TEXT NOT NULL DEFAULT '';
 ALTER TABLE job_runs ADD COLUMN message TEXT NOT NULL DEFAULT '';
-CREATE UNIQUE INDEX outbound_single_active ON outbound_attempts(offer_id)
-WHERE status IN ('sending','uncertain');
 INSERT INTO settings(key,value) VALUES('ai.unconfirmed_tokens','0')
 ON CONFLICT(key) DO UPDATE SET value='0';
-'''
+''' + OUTBOUND_RESERVATION
 
 MARKET_PROGRESS = '''
 CREATE TABLE job_source_responses(
@@ -124,8 +143,13 @@ CREATE TABLE mail_opt_out_requests(message_id TEXT PRIMARY KEY);
 CREATE INDEX mail_outgoing_sender_time ON mail_messages(lower(sender),sent_at) WHERE direction='outgoing';
 '''
 
+# Every legacy Message-ID remains available for reconciliation, even if the old
+# schema allowed multiple active attempts. Only new reservations are restricted.
+LEGACY_OUTBOUND_RESERVATION = 'DROP INDEX IF EXISTS outbound_single_active;\n' + OUTBOUND_RESERVATION
+
 MIGRATIONS = {1: SCHEMA, 2: MARKET_AND_FIT, 3: MARKET_SOURCES, 4: PREDICTABLE_ACTIONS,
-              5: MARKET_PROGRESS, 6: COMPANY_LOCATIONS, 7: USAGE_ACCOUNTING, 8: MAIL_DELIVERY_AND_OPT_OUT}
+              5: MARKET_PROGRESS, 6: COMPANY_LOCATIONS, 7: USAGE_ACCOUNTING, 8: MAIL_DELIVERY_AND_OPT_OUT,
+              9: LEGACY_OUTBOUND_RESERVATION}
 
 def migrate(connection):
     current = connection.execute('PRAGMA user_version').fetchone()[0]

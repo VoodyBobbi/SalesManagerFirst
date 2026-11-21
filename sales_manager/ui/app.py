@@ -9,7 +9,7 @@ import uuid
 from datetime import date
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QLockFile, QSize, QThreadPool, QTimer
+from PySide6.QtCore import Qt, QLockFile, QSize, QSignalBlocker, QThreadPool, QTimer
 from PySide6.QtGui import QColor, QIcon, QPalette
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFormLayout, QGridLayout,
@@ -120,7 +120,7 @@ class Window(QMainWindow):
     def __init__(self, store=None, secrets=None):
         super().__init__()
         configure_application(QApplication.instance())
-        self.store = store or Store()
+        self.store = store or Store(defer_legacy_review=True)
         self.secrets = secrets or Secrets()
         self.research = ResearchService(self.store, self.secrets)
         self.ai = AIService(self.store, self.secrets)
@@ -137,6 +137,7 @@ class Window(QMainWindow):
         self._market_loading = False
         self.mail_busy = False
         self.mail_cancel = threading.Event()
+        self.maintenance_cancel = None
         self.search_check_busy = False
         self._closing = False
         self._close_started = None
@@ -480,7 +481,8 @@ class Window(QMainWindow):
             product = None
             if previous_branch != normalized:
                 product = self.store.one('SELECT id FROM products WHERE normalized=?', (previous_branch,))
-            product = product or self.store.ensure_product(text, normalized)
+            product = product or (self.store.ensure_product(text, normalized) if normalized.startswith('branch:')
+                                  else self.store.ensure_generic_product(text, normalized))
         except (ValueError, RuntimeError) as exc:
             self.guide(str(exc), tone='error')
             return
@@ -714,6 +716,13 @@ class Window(QMainWindow):
     def add_company(self):
         if not self.product_id:
             return
+        run = self.store.one("""SELECT id FROM job_runs WHERE product_id=? AND countries=? AND kind LIKE 'manual:%'
+            AND status IN ('paused','failed','running','interrupted') AND EXISTS
+            (SELECT 1 FROM job_queue q WHERE q.run_id=job_runs.id) ORDER BY id DESC LIMIT 1""",
+                             (self.product_id, json.dumps(self.countries, ensure_ascii=False)))
+        if run:
+            self.start_research('companies', run_id=run['id'], manual_resume=True)
+            return
         dialog = QInputDialog(self)
         dialog.setWindowTitle('Добавить компанию')
         dialog.setLabelText('Ссылка на официальный сайт')
@@ -811,6 +820,7 @@ class Window(QMainWindow):
     def research_done(self, result):
         if isinstance(result, dict):
             if self.research_kind == 'market':
+                self._market_notice_countries = json.dumps(self.countries, ensure_ascii=False)
                 self.clear_guide()
                 message = result.get('message')
                 if result.get('run_id'):
@@ -854,13 +864,25 @@ class Window(QMainWindow):
         self.update_resume_labels()
         self.update_search_usage()
         self.update_ai_status()
-        self.start_maintenance()
         if self._auto_recovery_enabled and not self.recovery_timer.isActive():
             self.recovery_timer.start(100)
+        else:
+            self.start_maintenance()
 
     def start_maintenance(self, *, startup=False):
-        if not self._closing:
-            self.submit(lambda emit: self.store.retention(startup=startup), busy_message='Обслуживаем базу данных',
+        if self._closing or self._foreground_worker is not None:
+            return
+        if self.store.legacy_review_pending():
+            def reviewed(_):
+                self.refresh_companies()
+                self.start_maintenance()
+            self.submit(lambda emit: self.store.review_legacy_fit(), reviewed,
+                        busy_message='Проверяем сохранённые оценки компаний')
+        elif self.maintenance_cancel is None and self.store.retention_due() and not self.recovery_timer.isActive():
+            token = self.maintenance_cancel = threading.Event()
+            def finished():
+                self.maintenance_cancel = None
+            self.submit(lambda emit: self.store.retention(startup=True, cancel=token), finished=finished,
                         failed=lambda message: self.statusBar().showMessage(message, 15000))
 
     def update_resume_labels(self):
@@ -873,22 +895,26 @@ class Window(QMainWindow):
         for kind, product_id, widget in (('market', None, self.market_research_notice),
                                          ('companies', self.product_id, self.company_research_notice)):
             if kind == 'companies':
-                row = self.store.one("SELECT status,message FROM job_runs WHERE (kind='companies' OR kind LIKE 'manual:%') AND product_id IS ? AND countries=? AND status IN ('paused','failed','running','interrupted','complete_partial') ORDER BY id DESC LIMIT 1", (product_id, signature))
+                row = self.store.one("""SELECT kind,status,message FROM job_runs WHERE
+                    (kind='companies' OR kind LIKE 'manual:%') AND product_id IS ? AND countries=?
+                    ORDER BY (status IN ('paused','failed','running','interrupted','complete_partial')) DESC,id DESC LIMIT 1""",
+                                     (product_id, signature))
             else:
                 row = self.store.one('SELECT status,message FROM job_runs WHERE kind=? AND product_id IS ? AND countries=? ORDER BY id DESC LIMIT 1', (kind, product_id, signature))
             if kind == 'market' and row:
                 latest = self.store.one("SELECT id FROM job_runs WHERE kind='market' AND product_id IS NULL AND countries=? ORDER BY id DESC LIMIT 1", (signature,))
                 text = market_summary(self.store, latest['id'], self.countries, count=len(self.market_rows))['message']
+            elif kind == 'market' and getattr(self, '_market_notice_countries', None) == signature:
+                text = widget.text()
             else:
                 if row and row['status'] in ('paused', 'failed', 'running', 'interrupted', 'complete_partial'):
                     text = ('Поиск идёт. Ищем компании, которым может подойти товар.' if self.research_cancel is not None else
                             'Незавершённый поиск сохранён.' + (
                                 ' Продолжится в режиме автоматического восстановления.' if self._auto_recovery_enabled else
+                                ' Нажмите «Добавить компанию», чтобы продолжить.' if row['kind'].startswith('manual:') else
                                 ' Нажмите «Найти компании», чтобы продолжить.'))
                 else:
-                    text = ''
-                if not row and widget.text().startswith('Поиск завершён.'):
-                    continue
+                    text = row['message'] if row else ''
             widget.setText(text)
             widget.setVisible(bool(text))
 
@@ -909,7 +935,8 @@ class Window(QMainWindow):
             return
         runs = self.store.query("""SELECT * FROM job_runs WHERE status IN
             ('paused','failed','running','interrupted','complete_partial')
-            AND EXISTS(SELECT 1 FROM job_queue q WHERE q.run_id=job_runs.id AND q.status!='done')
+            AND (status!='complete_partial' OR EXISTS(SELECT 1 FROM job_queue q WHERE q.run_id=job_runs.id AND q.status!='done'))
+            AND (kind NOT LIKE 'manual:%' OR EXISTS(SELECT 1 FROM job_queue q WHERE q.run_id=job_runs.id))
             ORDER BY id""")
         for run in runs:
             if run['id'] in self._recovery_attempted:
@@ -932,6 +959,7 @@ class Window(QMainWindow):
                 self.start_research('companies', run_id=run['id'], manual_resume=run['kind'].startswith('manual:'), recovery=True)
             self.guide('Восстанавливаем сохранённый поиск. Может использовать сеть и квоты включённых источников.')
             return
+        self.start_maintenance()
 
     def build_settings(self):
         page = QWidget()
@@ -965,6 +993,7 @@ class Window(QMainWindow):
         self.ai_limit = spin(1000, 1_000_000, self.store.get_setting('ai.token_limit', 30000))
         self.ai_status = label('Не подключено')
         self.ai_status.setObjectName('muted')
+        self.ai_model.currentTextChanged.connect(lambda _: self.update_ai_status(refresh_models=False))
         self.ai_budget_status = label('')
         self.ai_budget_status.setObjectName('muted')
         self.ai_auto_assess = QCheckBox('Автоматически оценивать компании')
@@ -1326,18 +1355,30 @@ class Window(QMainWindow):
             error_id = log_exception('Сверка расхода GigaChat', exc)
             QMessageBox.information(self, 'Сверка расхода', humanize_error(exc, error_id))
 
-    def update_ai_status(self):
+    def update_ai_status(self, *, refresh_models=True):
+        models = self.store.get_setting('ai.models', [])
+        if refresh_models and models:
+            model = self.ai_model.currentText()
+            if model not in models:
+                model = self.store.get_setting('ai.model', 'GigaChat-2')
+            with QSignalBlocker(self.ai_model):
+                self.ai_model.clear()
+                self.ai_model.addItems(models)
+                self.ai_model.setCurrentText(model)
         usage = self.store.token_usage()
         balance = self.store.get_setting('ai.balance')
         checked = self.store.get_setting('ai.checked_at', '')
         if not checked:
             text = 'Не подключено'
-        elif isinstance(balance, dict) and isinstance(balance.get('balance'), list):
+        elif isinstance(balance, dict) and any(isinstance(balance.get(key), list) for key in ('balance', 'balances')):
             balances = balance.get('balance') or balance.get('balances') or []
-            if isinstance(balances, list):
-                detail = ', '.join(f"{r.get('value', r.get('usage', '—'))} токенов" for r in balances if isinstance(r, dict))
-            else:
-                detail = str(balances)
+            model = self.ai_model.currentText()
+            entries = [(str(row.get('model') or row.get('usage') or ''), row.get('value', '—'))
+                       for row in balances if isinstance(row, dict)]
+            entries.sort(key=lambda row: row[0].casefold() != model.casefold())
+            detail = ', '.join(f'{value} токенов ({name or "модель не указана"}'
+                               + (', выбрана)' if name.casefold() == model.casefold() else ')')
+                               for name, value in entries)
             text = ('Остаток: ' + detail if detail else 'Баланс получен') + ' · ' + str(checked)[:16]
         else:
             text = 'Баланс по API недоступен'
@@ -1350,16 +1391,6 @@ class Window(QMainWindow):
         self.ai_status.setText(f'{text}\nПодтверждённый расход: {usage} токенов{tail}')
         self.ai_status.setToolTip(json.dumps(balance, ensure_ascii=False) if balance else '')
         self.update_ai_budget()
-        model = self.ai_model.currentText()
-        models = self.store.get_setting('ai.models', [])
-        if models:
-            self.ai_model.clear()
-            self.ai_model.addItems(models)
-            if model not in models:
-                model = self.store.get_setting('ai.model', 'GigaChat-2')
-            index = self.ai_model.findText(model)
-            if index >= 0:
-                self.ai_model.setCurrentIndex(index)
 
     def update_ai_budget(self):
         used = self.store.token_usage()
@@ -1584,7 +1615,11 @@ class Window(QMainWindow):
         if self.mail_busy:
             self.guide('Дождитесь завершения работы с почтой.')
             return
-        for row in self.mail.pending_opt_outs():
+        requests = self.mail.pending_opt_outs()
+        if not requests:
+            self.guide('Новых просьб об отписке нет.')
+            return
+        for row in requests:
             box = QMessageBox(QMessageBox.Icon.Question, 'Возможная просьба об отписке',
                               f"Запретить отправку на {row['sender']}?\nТема письма: {row['subject']}",
                               parent=self)
@@ -1627,6 +1662,8 @@ class Window(QMainWindow):
             self.refresh_timer.stop()
             if self.research_cancel is not None:
                 self.research_cancel.set()
+            if self.maintenance_cancel is not None:
+                self.maintenance_cancel.set()
             if self._close_started is None:
                 self._close_started = time.monotonic()
                 self.mail_cancel.set()

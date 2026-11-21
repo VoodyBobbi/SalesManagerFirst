@@ -20,6 +20,7 @@ from email.message import EmailMessage
 from email.utils import format_datetime, formataddr, getaddresses, make_msgid, parseaddr, parsedate_to_datetime
 
 import truststore
+from sales_manager.core.diagnostics import log_exception
 
 from sales_manager.storage import now
 from sales_manager.core.contacts import (ascii_domain, company_emails, email_purpose, is_contact_email,
@@ -30,12 +31,13 @@ from urllib.parse import quote, urlsplit
 MAX_MESSAGE_BYTES = 2_000_000
 DEFAULT_DAILY_LIMIT = 20
 _UNSUBSCRIBE_FOOTER = 'Чтобы отказаться от писем, ответьте «Не пишите».'
-_OPT_OUT_REQUEST = re.compile(r'(?im)^ *(?:пожалуйста[ ,]+)?(?:не пишите\b|отпишите\b|отпишитесь\b|'
+_OPT_OUT_REQUEST = re.compile(r'(?im)^ *(?:пожалуйста[ ,]+)?(?:(?:больше\s+)?не пишите\b|отпишите\b|отпишитесь\b|'
                               r'прошу отписать\b|прошу больше не писать\b|unsubscribe\b|'
                               r'please (?:unsubscribe\b|remove me\b|stop (?:emailing|writing)\b))')
 _MAILBOX_WIRE = re.compile(r'"(?:[^"\\\x00-\x1f]|\\["\\])*"|[^\s"{}\\\x00-\x1f]+')
 _IMAP_MONTHS = ('Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
                 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec')
+_CONNECTION_SLOTS = threading.BoundedSemaphore(4)
 GMAIL_APP_PASSWORD_URL = 'https://myaccount.google.com/apppasswords'
 MAIL_PROVIDERS = (
     ('gmail', 'Gmail (Google)'),
@@ -325,9 +327,56 @@ class MailService:
     def _tls():
         return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 
+    def _connect(self, factory, *args, **kwargs):
+        if self._cancel is None:
+            return factory(*args, **kwargs)
+        while not _CONNECTION_SLOTS.acquire(timeout=0.1):
+            self._check_cancelled()
+        ready, abandoned = threading.Event(), threading.Event()
+        guard, result = threading.Lock(), []
+
+        def connect():
+            try:
+                connection = factory(*args, **kwargs)
+            except Exception as exc:
+                outcome = (None, exc)
+            else:
+                outcome = (connection, None)
+            finally:
+                _CONNECTION_SLOTS.release()
+            with guard:
+                if not abandoned.is_set():
+                    result.append(outcome)
+                    ready.set()
+                    return
+            if outcome[0] is not None:
+                sock = getattr(outcome[0], 'sock', None)
+                stream = getattr(outcome[0], 'file', None)
+                try:
+                    if stream is not None:
+                        stream.close()
+                finally:
+                    if sock is not None:
+                        sock.close()
+
+        threading.Thread(target=connect, daemon=True).start()
+        try:
+            while not ready.wait(0.1):
+                self._check_cancelled()
+        except MailCancelled:
+            with guard:
+                if not result:
+                    abandoned.set()
+                    raise
+        connection, error = result[0]
+        if error:
+            self._check_cancelled()
+            raise error
+        return connection
+
     def _imap(self, account, password):
         self._check_cancelled()
-        connection = imaplib.IMAP4_SSL(account['imap_host'], int(account['imap_port']),
+        connection = self._connect(imaplib.IMAP4_SSL, account['imap_host'], int(account['imap_port']),
                                       ssl_context=self._tls(), timeout=30)
         try:
             self._activate(connection)
@@ -350,10 +399,10 @@ class MailService:
         try:
             self._check_cancelled()
             if int(account['smtp_port']) == 465:
-                connection = smtplib.SMTP_SSL(account['smtp_host'], 465, timeout=30, context=self._tls())
+                connection = self._connect(smtplib.SMTP_SSL, account['smtp_host'], 465, timeout=30, context=self._tls())
                 self._activate(connection)
             else:
-                connection = smtplib.SMTP(account['smtp_host'], 587, timeout=30)
+                connection = self._connect(smtplib.SMTP, account['smtp_host'], 587, timeout=30)
                 self._activate(connection)
                 connection.ehlo()
                 self._check_cancelled()
@@ -683,7 +732,6 @@ class MailService:
                 if refused:
                     raise smtplib.SMTPRecipientsRefused(refused)
                 self.store.execute("UPDATE outbound_attempts SET status='sent',updated_at=? WHERE message_id=?", (now(), message_id))
-                self.store.audit('mail.accepted')
             except MailAuthenticationError as exc:
                 self.store.execute("UPDATE outbound_attempts SET status='failed',error=?,updated_at=? WHERE message_id=?",
                                    (str(exc), now(), message_id))
@@ -717,6 +765,10 @@ class MailService:
                 raise RuntimeError(error) from exc
             finally:
                 self._close_smtp(smtp)
+            try:
+                self.store.audit('mail.accepted')
+            except Exception as exc:
+                log_exception('Журнал подтверждённой отправки', exc)
             # SMTP success remains success even if saving the sent copy fails.
             self._append_sent(account, password, msg)
             return 'Отправлено'
@@ -729,12 +781,21 @@ class MailService:
             if folder:
                 if not self._find_message(connection, folder, message['Message-ID'], self._check_cancelled):
                     self._check_cancelled()
-                    connection.append(_mailbox_argument(folder), '\\Seen', imaplib.Time2Internaldate(time.time()), message.as_bytes())
+                    status, _ = connection.append(_mailbox_argument(folder), '\\Seen',
+                                                  imaplib.Time2Internaldate(time.time()), message.as_bytes())
+                    if status != 'OK':
+                        raise SentReconciliationError('Сервер отклонил сохранение копии письма.')
+            else:
+                raise SentReconciliationError('Папка отправленных не найдена.')
         except MailCancelled:
             return
-        except Exception:
+        except Exception as exc:
             if self._cancel is None or not self._cancel.is_set():
-                self.store.audit('mail.sent_copy_pending')
+                log_exception('Сохранение копии отправленного письма', exc)
+                try:
+                    self.store.audit('mail.sent_copy_pending')
+                except Exception as audit_error:
+                    log_exception('Журнал сохранения копии письма', audit_error)
         finally:
             self._close_imap(connection)
 
@@ -758,21 +819,27 @@ class MailService:
         if status != 'OK' or not result or not isinstance(result[0], bytes):
             raise SentReconciliationError('Не удалось проверить копию в отправленных.')
         # Confirm the full Message-ID header, not just a substring search.
+        unreadable = False
         for uid in result[0].split():
             state, data = connection.uid('fetch', uid, '(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])')
             if check_cancelled:
                 check_cancelled()
             if state != 'OK':
-                raise SentReconciliationError('Не удалось прочитать заголовок отправленного письма.')
+                unreadable = True
+                continue
             raw = next((item[1] for item in data or [] if isinstance(item, tuple) and len(item) > 1 and isinstance(item[1], bytes)), None)
             if not raw:
-                raise SentReconciliationError('Сервер не вернул заголовок отправленного письма.')
+                unreadable = True
+                continue
             parsed = email.message_from_bytes(raw, policy=policy.default)
             found_id = str(parsed.get('Message-ID', '')).strip()
             if not found_id:
-                raise SentReconciliationError('Сервер не вернул идентификатор отправленного письма.')
+                unreadable = True
+                continue
             if found_id == message_id:
                 return True
+        if unreadable:
+            raise SentReconciliationError('Не удалось прочитать все заголовки отправленных писем.')
         return False
 
     def reconcile(self, cancel=None):
@@ -789,8 +856,9 @@ class MailService:
                 connection = self._imap(account, password)
                 preferred = account.get('sent_folder')
                 fallback = None
-                checked = False
+                unchecked = 0
                 for attempt in attempts:
+                    checked = False
                     if preferred:
                         try:
                             confirmed = self._find_message(connection, preferred, attempt['message_id'], self._check_cancelled)
@@ -815,9 +883,11 @@ class MailService:
                             self._check_cancelled()
                             found += self._confirm_attempt(attempt['id'])
                             break
-                if not checked:
+                    unchecked += not checked
+                if unchecked == len(attempts):
                     raise SentReconciliationError('Не удалось проверить папки отправленных. Проверьте выбранную папку в настройках почты.')
-                return 'Подтверждено отправок: ' + str(found)
+                result = 'Подтверждено отправок: ' + str(found)
+                return result + (f'. Не удалось проверить отправок: {unchecked}.' if unchecked else '')
             except (imaplib.IMAP4.error, OSError) as exc:
                 self._check_cancelled()
                 raise SentReconciliationError('Не удалось проверить отправленные письма.') from exc
@@ -947,7 +1017,9 @@ class MailService:
             account, password = self._account(require_connected=True)
             sent_warning = ''
             try:
-                self.reconcile()
+                reconciliation = self.reconcile()
+                if reconciliation and 'Не удалось проверить отправок:' in reconciliation:
+                    sent_warning = reconciliation
             except SentReconciliationError as exc:
                 sent_warning = f'{exc} Неясные отправки сохранены.'
             connection = None
@@ -1016,24 +1088,36 @@ class MailService:
                         message_id = str(message.get('Message-ID', '')).strip()
                         if message_id and len(message_id) < 500:
                             unsubscribed += self._automatic_opt_out(message, account, message_id)
-                        if source and message_id and len(message_id) < 500:
-                            auto = is_automatic(message, matched_reply=True)
+                        if message_id and len(message_id) < 500:
+                            matched_reply = source is not None
+                            auto = is_automatic(message, matched_reply=matched_reply)
+                            peer = normalize_email(parseaddr(str(message.get('From', '')))[1])
+                            body = 'Текст не загружен: письмо больше 2 МБ.' if large else message_text(message)
+                            review = (is_contact_email(peer) and not auto and self._possible_opt_out(message, body)
+                                      and not self.store.one('SELECT email FROM opt_out WHERE lower(email)=?', (peer,)))
+                            if not source and review and normalize_email(account['email']) in _recipient_addresses(message):
+                                source = self.store.one("""SELECT product_id,company_id FROM mail_messages
+                                    WHERE direction='outgoing' AND lower(sender)=? AND lower(recipient)=?
+                                    ORDER BY id DESC LIMIT 1""", (normalize_email(account['email']), peer))
+                                if not source:
+                                    source = self.store.one("""SELECT f.product_id,f.company_id FROM company_fit f
+                                        JOIN company_contacts c ON c.company_id=f.company_id
+                                        WHERE c.kind='email' AND lower(c.value)=? ORDER BY f.checked_at DESC LIMIT 1""", (peer,))
+                        else:
+                            source = None
+                        if source:
                             try:
                                 sent_at = parsedate_to_datetime(str(message.get('Date', ''))).astimezone(timezone.utc).isoformat()
                             except (TypeError, ValueError, OverflowError):
                                 sent_at = now()
-                            peer = normalize_email(parseaddr(str(message.get('From', '')))[1])
-                            body = 'Текст не загружен: письмо больше 2 МБ.' if large else message_text(message)
-                            review = (not auto and self._possible_opt_out(message, body)
-                                      and not self.store.one('SELECT email FROM opt_out WHERE lower(email)=?', (peer,)))
                             self._check_cancelled()
                             with self.store.db as db:
                                 inserted = db.execute('INSERT OR IGNORE INTO mail_messages(product_id,company_id,message_id,in_reply_to,refs,direction,sender,recipient,subject,body,sent_at,is_reply,opt_out_review) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
                                     (source['product_id'], source['company_id'], message_id, str(message.get('In-Reply-To', '')),
                                      str(message.get('References', '')), 'incoming', peer, account['email'],
-                                     str(message.get('Subject', ''))[:500], body, sent_at, int(not auto), int(review)))
+                                     str(message.get('Subject', ''))[:500], body, sent_at, int(matched_reply and not auto), int(review)))
                             if inserted.rowcount:
-                                matched += not auto
+                                matched += matched_reply and not auto
                                 possible += review
                     # Commit checkpoint only after successful processing.
                     self._check_cancelled()

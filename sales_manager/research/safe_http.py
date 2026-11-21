@@ -6,22 +6,33 @@ hostname. This avoids the DNS validation/connection rebinding race.
 import http.client
 import codecs
 import ipaddress
+import math
 import re
 import socket
 import ssl
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from email.message import Message
 from html.parser import HTMLParser
 from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
-USER_AGENT = 'SalesManagerFirst/1.0 (public business research; robots respected)'
+_PRODUCT_TOKEN = 'SalesManagerFirst'
+USER_AGENT = f'{_PRODUCT_TOKEN}/1.0 (public business research; robots respected)'
 _DNS_SLOTS = threading.BoundedSemaphore(4)
 _ROBOTS_BACKOFF = 45
+_ROBOTS_TTL = 86400
+_ROBOTS_ORIGINS = 256
+_MAX_CRAWL_DELAY = 60
+_XML_ENCODING = re.compile(br"""^<\?xml\s+[^?]*?\bencoding\s*=\s*(['"])([A-Za-z][\w.-]*)\1""")
 
 class FetchError(RuntimeError):
     pass
+
+
+class TransientFetchError(FetchError):
+    """A fetch failure that should not be cached."""
 
 
 def _robots_normalize(value):
@@ -58,7 +69,7 @@ class RobotsRules:
             elif agents and name == 'crawl-delay':
                 try:
                     delay = float(value)
-                    if delay >= 0:
+                    if math.isfinite(delay) and delay >= 0:
                         delays.append(delay)
                 except ValueError:
                     pass
@@ -66,8 +77,8 @@ class RobotsRules:
             self.groups.append((agents, rules, delays))
 
     def _selected(self, user_agent):
-        product = user_agent.casefold()
-        matched = [g for g in self.groups if any(a != '*' and a in product for a in g[0])]
+        product = user_agent.casefold().split('/', 1)[0]
+        matched = [g for g in self.groups if product in g[0]]
         return matched or [g for g in self.groups if '*' in g[0]]
 
     def can_fetch(self, user_agent, url):
@@ -141,8 +152,13 @@ def public_addresses(host, port):
 def _bounded_dns(host, port, deadline, check_cancel):
     # The OS may block in getaddrinfo. Timed-out calls retain their slot until
     # they actually exit, so repeated attempts cannot accumulate threads.
-    if not _DNS_SLOTS.acquire(blocking=False):
-        raise FetchError('Служба DNS занята; используем другие источники.')
+    while True:
+        check_cancel()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TransientFetchError('Служба DNS занята; используем другие источники.')
+        if _DNS_SLOTS.acquire(timeout=min(.1, remaining)):
+            break
     finished = threading.Event()
     result = []
 
@@ -159,12 +175,12 @@ def _bounded_dns(host, port, deadline, check_cancel):
         threading.Thread(target=resolve, name='market-dns', daemon=True).start()
     except RuntimeError:
         _DNS_SLOTS.release()
-        raise FetchError('Не удалось запустить проверку DNS.') from None
+        raise TransientFetchError('Не удалось запустить проверку DNS.') from None
     while True:
         check_cancel()
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise FetchError('Превышено время определения адреса DNS.')
+            raise TransientFetchError('Превышено время определения адреса DNS.')
         if finished.wait(min(.1, remaining)):
             check_cancel()
             if isinstance(result[0], Exception):
@@ -210,6 +226,8 @@ class FetchResult:
                 encoding = 'utf-8-sig'
             elif self.content.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
                 encoding = 'utf-16'
+            elif declaration := _XML_ENCODING.match(self.content[:1024]):
+                encoding = declaration[2].decode('ascii')
             elif self.media_type in ('', 'text/html', 'application/xhtml+xml'):
                 parser = _CharsetParser()
                 parser.feed(self.content[:8192].decode('ascii', errors='ignore'))
@@ -251,7 +269,10 @@ class SafeFetcher:
         self._robots_checked_at = {}
         self._robots_retry_at = {}
         self._last_request = {}
-        self._robots_locks = {}
+        self._robots_locks = OrderedDict()
+        self._robots_users = {}
+        self._robots_registry_lock = threading.Lock()
+        self._next_robots_cleanup = 0
 
     def _check_cancel(self):
         if self.cancel_check is not None:
@@ -331,8 +352,13 @@ class SafeFetcher:
         max_redirects = max(5, self.max_redirects) if truncate else self.max_redirects
         for hop in range(max_redirects + 1):
             self._check_cancel()
+            policy_started = time.monotonic()
+            if policy_started >= deadline:
+                raise FetchError('Превышено время загрузки.')
             if respect_robots:
                 self._check_robots(current)
+                # Site policy can require a longer wait than the network timeout.
+                deadline += time.monotonic() - policy_started
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise FetchError('Превышено время загрузки.')
@@ -359,22 +385,55 @@ class SafeFetcher:
         origin = f'{parsed.scheme}://{parsed.netloc.removesuffix(f":{default_port}")}'
         # Independent hosts may redirect to one origin during a parallel batch.
         # Reserve its next permitted request atomically, including robots load.
-        lock = self._robots_locks.setdefault(origin, threading.RLock())
         self._check_cancel()
-        while not lock.acquire(timeout=.1):
-            self._check_cancel()
+        with self._robots_registry_lock:
+            lock = self._robots_locks.get(origin)
+            if lock is None:
+                lock = self._robots_locks[origin] = threading.RLock()
+            self._robots_locks.move_to_end(origin)
+            self._robots_users[origin] = self._robots_users.get(origin, 0) + 1
+            self._prune_robots_locked(time.monotonic())
         try:
-            self._check_cancel()
-            self._check_robots_locked(url, origin)
+            while not lock.acquire(timeout=.1):
+                self._check_cancel()
+            try:
+                self._check_cancel()
+                self._check_robots_locked(url, origin)
+            finally:
+                lock.release()
         finally:
-            lock.release()
+            with self._robots_registry_lock:
+                self._robots_users[origin] -= 1
+                if not self._robots_users[origin]:
+                    del self._robots_users[origin]
+
+    def _prune_robots_locked(self, timestamp):
+        if (timestamp < self._next_robots_cleanup
+                and len(self._robots_locks) <= _ROBOTS_ORIGINS):
+            return
+        self._next_robots_cleanup = timestamp + _MAX_CRAWL_DELAY
+        for origin in list(self._robots_locks):
+            if origin in self._robots_users:
+                continue
+            last_request = self._last_request.get(origin)
+            if (timestamp < self._robots_retry_at.get(origin, 0)
+                    or (last_request is not None and timestamp < last_request + _MAX_CRAWL_DELAY)):
+                continue
+            checked_at = self._robots_checked_at.get(origin)
+            if (len(self._robots_locks) > _ROBOTS_ORIGINS
+                    or checked_at is None or timestamp >= checked_at + _ROBOTS_TTL):
+                self._robots_locks.pop(origin, None)
+                self._robots.pop(origin, None)
+                self._robots_checked_at.pop(origin, None)
+                self._robots_retry_at.pop(origin, None)
+                self._last_request.pop(origin, None)
 
     def _check_robots_locked(self, url, origin):
         timestamp = time.monotonic()
         if timestamp < self._robots_retry_at.get(origin, 0):
             raise FetchError('robots.txt временно недоступен. Повторите позже.')
         self._robots_retry_at.pop(origin, None)
-        if origin not in self._robots or timestamp - self._robots_checked_at.get(origin, 0) >= 86400:
+        if origin not in self._robots or timestamp - self._robots_checked_at.get(origin, 0) >= _ROBOTS_TTL:
             result = self._raw(origin + '/robots.txt', 500 * 1024, truncate=True)
             if result.status == 429 or 500 <= result.status < 600:
                 self._robots_retry_at[origin] = time.monotonic() + _ROBOTS_BACKOFF
@@ -385,14 +444,16 @@ class SafeFetcher:
             self._robots[origin] = robot
             self._robots_checked_at[origin] = time.monotonic()
         robot = self._robots[origin]
-        if not robot.can_fetch('SalesManagerFirst', url):
+        if not robot.can_fetch(_PRODUCT_TOKEN, url):
             raise FetchError('Сайт запретил автоматическое чтение этого раздела (robots.txt).')
-        delay = max(0.35, float(robot.crawl_delay('SalesManagerFirst') or 0))
-        if delay > 60:
+        delay = max(.35, robot.crawl_delay(_PRODUCT_TOKEN))
+        if delay > _MAX_CRAWL_DELAY:
             raise FetchError('Сайт требует длительную паузу robots.txt; автоматический обход остановлен.')
-        elapsed = time.monotonic() - self._last_request.get(origin, 0)
-        if elapsed < delay:
-            self._wait(delay - elapsed)
+        last_request = self._last_request.get(origin)
+        if last_request is not None:
+            remaining = delay - (time.monotonic() - last_request)
+            if remaining > 0:
+                self._wait(remaining)
         self._last_request[origin] = time.monotonic()
 
     def fetch(self, url):

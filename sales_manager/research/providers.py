@@ -279,12 +279,18 @@ class GDELTProvider:
                              r.get('seendate', ''), {'provider': self.name, 'source_country': r.get('sourcecountry', '')})
                 for r in rows(data, 'articles') if isinstance(r, dict) and r.get('url')]
 
+def overpass_elements(data):
+    if data.get('remark'):
+        raise TransientProviderError('Overpass прервал исследование: сервер перегружен или превышен лимит.')
+    return rows(data, 'elements')
+
+
 class OverpassProvider:
     name = 'overpass'
 
-    def __init__(self, request=json_http):
+    def __init__(self, request=json_http, *, retry_at=None):
         self.request = request
-        self._retry_at = {}
+        self._retry_at = {} if retry_at is None else retry_at
 
     def search(self, query, country, limit=10):
         filters = osm_filters(query)
@@ -303,9 +309,7 @@ class OverpassProvider:
                 continue
             try:
                 data = self.request('POST', endpoint, data={'data': statement})
-                if data.get('remark'):
-                    raise TransientProviderError('Overpass прервал исследование: сервер перегружен или превышен лимит.')
-                elements = rows(data, 'elements')
+                elements = overpass_elements(data)
                 break
             except ProviderError as exc:
                 error = exc
@@ -537,10 +541,11 @@ class RSSProvider:
         items = self._load_items()
         if not self.last_responded:
             raise ProviderError('RSS недоступны. Проверьте адреса лент и разрешение чтения; используем другие источники.')
-        limit = max(0, min(int(limit), 1600))
+        if limit is not None:
+            items = items[:max(0, int(limit))]
         # Country here is a search context, never proof of an article's geography.
         return [SearchResult(item.url, item.title, item.snippet, country,
-                             item.published_at, dict(item.metadata)) for item in items[:limit]]
+                             item.published_at, dict(item.metadata)) for item in items]
 
     def search(self, query, country, limit=10):
         from .normalization import CATEGORIES, clean_text, product_candidates, normalize_product
@@ -554,12 +559,14 @@ class RSSProvider:
         words = [w[:max(4, len(w)-2)] for w in re.findall(r'[а-яёa-z]{4,}', query.casefold())
                  if w not in ('россия', 'контакты', 'компании', 'официальный', 'спрос', 'рынок', 'новости', 'отчет', 'сайт')]
         output = []
-        for item in self.discover(country, limit=1600):
+        for item in self.discover(country, limit=None):
             text = (item.title + ' ' + item.snippet).casefold()
             relevant = (not normalized_wanted.isdisjoint(product_candidates(text)) if normalized_wanted
                         else any(word in text for word in words))
             if relevant:
                 output.append(item)
+                if len(output) >= limit:
+                    break
         return output[:limit]
 
 

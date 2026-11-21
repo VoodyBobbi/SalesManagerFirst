@@ -180,7 +180,11 @@ def test_manual_fit_keeps_send_permission_and_opt_out_guards(window, qtbot, opt_
     dialog = OfferDialog(window, cid)
     qtbot.addWidget(dialog)
     dialog.send()
-    assert 'разрешения на контакт' in dialog.notice.text()
+    if opt_out:
+        assert 'сохранён запрет на письма' in dialog.notice.text()
+        assert dialog.permission_button.isHidden()
+    else:
+        assert 'разрешения на контакт' in dialog.notice.text()
     assert not window.workers
     assert window.store.query('SELECT * FROM outbound_attempts') == []
     dialog.close()

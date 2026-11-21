@@ -8,7 +8,8 @@ import math
 import re
 from calendar import monthrange
 from collections import defaultdict
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from functools import lru_cache
 
 from .normalization import ALIASES, clean_text, normalize_product, product_candidates, product_phrase
@@ -35,13 +36,13 @@ MONTHS = ['январ', 'феврал', 'март', 'апрел', 'ма(?:й|я|
           'август', 'сентябр', 'октябр', 'ноябр', 'декабр']
 NEGATIVE = re.compile(r'\b(?:сниж\w*|сниз\w*|сократ\w*|сокращ\w*|упал\w*|упад\w*|падени\w*|пада\w*|уменьш\w*|обвал\w*|спад\w*|просел\w*|просед\w*|обруш\w*)\b|'
     r'на\s+\d+(?:[.,]\d+)?\s*%\s+(?:меньше|хуже)|'
-    r'(?<![\w])[-−–]\s*\d|не\s+(?:вырос|раст|увелич|подтвержд)|нет\s+спрос|отсутств\w*\s+спрос', re.I)
+    r'(?<!\w)(?:-\d|−\s*\d)|\b(?:fell|declined|decreased|dropped)\b|не\s+(?:вырос|раст|увелич|подтвержд)|нет\s+спрос|отсутств\w*\s+спрос', re.I)
 FORECAST = re.compile(r'\b(?:прогноз\w*|ожида\w*|может|могут|предполож\w*|гипотез\w*|планиру\w*|вырастет|вырастут|'
-    r'увеличится|увеличатся|будет|будут|будущ\w*|предстоящ\w*|предсказыва\w*|потенциальн\w*)\b', re.I)
+    r'увеличится|увеличатся|будет|будут|будущ\w*|предстоящ\w*|предсказыва\w*|потенциальн\w*|forecast\w*|expected|may(?!\s+20\d{2}\b)|might|could|will)\b', re.I)
 SIGNAL = re.compile(r'спрос|продаж(?:и|ам|ами|ах)?\b|покуп\w*|потреблен|закуп|популяр|заказ|'
-                    r'просмотр\w*|интерес\w*|присматрив\w*', re.I)
+                    r'просмотр\w*|интерес\w*|присматрив\w*|\b(?:sales|sold|demand|purchases|orders)\b', re.I)
 GROWTH = re.compile(r'\b(?:вырос\w*|возрос\w*|раст[её]т|растут|увеличил\w*|увеличени\w*|рост\w*|прирост\w*|'
-                    r'стал[аи]?(?:\s+\w+){0,2}\s+чаще)', re.I)
+                    r'стал[аи]?(?:\s+\w+){0,2}\s+чаще|rose\b|grew\b|increased\b|growth\b|up\b)', re.I)
 TRANSACTION = re.compile(r'продан\w*|продал[аи]?\b|закупил[аи]?\b|закуплен\w*|приобрет[её]н\w*|купил[аи]?\b|приобр[её]л[аи]?\b|'
                          r'покупал[аи]?\b|покупали\b|заказывал[аи]?\b|заказывали\b|'
                          r'заказал[аи]?\b|получен\w*\s+заказ\w*|продаж\w*[^.!?]{0,90}\bсоставил\w*', re.I)
@@ -54,7 +55,7 @@ MARKET_PERIOD_LABEL = f'с {MARKET_START.year} года по настоящее 
 NUMBER = re.compile(r'(?<![\w])\d+(?:[ \u00a0\u202f]\d{3})*(?:[.,]\d+)?')
 YEAR_RANGE = re.compile(r'\b(20\d{2})\s*(?:[-–—]|\s+(?:до|по)\s+)\s*(20\d{2})\b', re.I)
 SCALE_UNIT = re.compile(r'^\s*(?P<scale>тыс\.?|млн\.?|миллион\w*|млрд\.?|миллиард\w*)?\s*'
-    r'(?P<unit>%|процент\w*|штук\w*|шт\.?\b|единиц\w*|руб\w*\.?|₽|доллар\w*|USD\b|\$|евро\b|EUR\b|€|заказ\w*|'
+    r'(?P<unit>%|процент\w*|штук\w*|шт\.?\b|единиц\w*|units?\b|руб\w*\.?|₽|доллар\w*|USD\b|\$|евро\b|EUR\b|€|заказ\w*|'
     r'поисков\w*\s+запрос\w*|запрос\w*|упоминан\w*|контракт\w*)?', re.I)
 # These dimensions and containers cannot be compared as individual goods.
 # Unsupported quantities remain publication signals until a typed metric exists.
@@ -63,7 +64,7 @@ NON_COUNT_UNIT = re.compile(
     r'квадратн\w*|кубическ\w*|упаков\w*|пач\w*|пакет\w*|короб\w*|банок|банки|'
     r'бутыл\w*|комплект\w*|набор\w*|kg|кг|г|мг|т|л|мл|м|мм|см|км|m[23²³]?)(?!\w)', re.I)
 METRIC_WORDS = {
-    'sales': re.compile(r'\b(?:продаж\w*|продан\w*|продал\w*|реализован\w*)', re.I),
+    'sales': re.compile(r'\b(?:продаж\w*|продан\w*|продал\w*|реализован\w*|sales\b|sold\b)', re.I),
     'purchases': re.compile(r'\b(?:закуп\w*|приобрет[её]н\w*|куплен\w*|купил[аи]?\b|приобр[её]л[аи]?\b)', re.I),
     'orders': re.compile(r'заказ\w*', re.I),
     'searches': re.compile(r'поисков\w*\s+запрос\w*|частотност\w*|запрос\w*\s+в\s+поиск\w*', re.I),
@@ -100,9 +101,18 @@ COUNTRY_ELLIPSIS = re.compile(
     + r'(?P<number>' + NUMBER.pattern + r')\s*(?P<unit>%|штук\w*|шт\.?)\s*[.!]?$', re.I)
 
 
+_ENGLISH_MONTHS = ('January', 'February', 'March', 'April', 'May', 'June',
+                   'July', 'August', 'September', 'October', 'November', 'December')
+_ENGLISH_MONTH = {alias.casefold(): index for index, name in enumerate(_ENGLISH_MONTHS, 1)
+                  for alias in (name, name[:3])}
+_EXPLICIT_YEAR = re.compile(r'\b(?:в|за|in|for|итогам|период\w*)\s+(20\d{2})\b', re.I)
+
+
 def period_from(text):
     """Use an explicit reporting period; publication date is never its substitute."""
     value = clean_text(text)
+    value = re.sub(r'\b(?:основан\w*|зарегистрирован\w*|founded|established)(?:\s+был[аио]?)?\s+(?:в|in)\s+20\d{2}\b',
+                   ' ', value)
     months = '(?:' + '|'.join(MONTHS) + r')\w*'
     match = re.search(r'\b(' + months + r')\s*(?:[-–—]|по)\s*(' + months + r')\s+(20\d{2})\b', value)
     if match:
@@ -136,7 +146,10 @@ def period_from(text):
     match = re.search(r'(?:\bв|\bза|итог\w*|период\w*)\s+(20\d{2})[-.](0[1-9]|1[0-2])\b', value)
     if match:
         return f'{match[1]}-{match[2]}'
-    match = re.search(r'(?:\bв|\bза|итог\w*|период\w*)\s+(20\d{2})(?:\s*г(?:од\w*|\.)?)?\b', value)
+    for match in re.finditer(r'\b([a-z]+)\s+(20\d{2})\b', value):
+        if month := _ENGLISH_MONTH.get(match[1]):
+            return f'{match[2]}-{month:02d}'
+    match = _EXPLICIT_YEAR.search(value)
     return match[1] if match else ''
 
 
@@ -223,13 +236,16 @@ def _market_fact_spans(text):
     for part in re.split(SENTENCE_BOUNDARY, text, flags=re.I):
         sentence = market_fact_clause(' '.join(part.split()))
         start = 0
-        if len(_country_mentions(sentence)) > 1:
+        if len(_country_mentions(sentence)) > 1 or FORECAST.search(sentence):
             separators = list(CLAUSE_BOUNDARY.finditer(sentence))
             for index, separator in enumerate(separators):
                 end = separators[index + 1].start() if index + 1 < len(separators) else len(sentence)
                 first = sentence[start:separator.start()]
                 second = sentence[separator.end():end]
-                if _geographical_claim(first) and _geographical_claim(second):
+                separated_forecast = (FORECAST.search(first) is None and FORECAST.search(second)
+                                      and GROWTH.search(first) and NUMBER.search(first)
+                                      and re.match(r'\s*(?:а|но|тогда как|while|but)\b', second, re.I))
+                if separated_forecast or (_geographical_claim(first) and _geographical_claim(second)):
                     yield first, sentence
                     start = separator.end()
         yield sentence[start:], sentence
@@ -369,12 +385,14 @@ def _counted_quantity(product, tail):
     unit = (suffix.group('unit') or '').casefold()
     remainder = tail[suffix.end():].lstrip()
     if unit:
-        if not re.match(r'штук|шт\.?\b|единиц', unit):
+        if not re.match(r'штук|шт\.?\b|единиц|units?\b', unit):
             return False
         # A bare "500 units" can refer back to an explicit nearby product.
         if not remainder or re.match(r'[.!?;,)]', remainder):
             return True
         if re.match(r'(?:в|во|за|по|из|на)\b', remainder, re.I):
+            return True
+        if re.match(r'(?:и\s+за|and\s+(?:in|for))\s+20\d{2}\b', remainder, re.I):
             return True
         return _direct_count_subject(product, remainder)
     if NON_COUNT_UNIT.match(remainder):
@@ -502,6 +520,26 @@ def market_publication_possible(published, as_of):
     return stamp is not None and MARKET_START <= stamp.date() <= as_of.date()
 
 
+def normalize_search_date(value, as_of):
+    """Resolve provider dates at ingestion so relative dates stay stable."""
+    value = (value or '').strip()
+    stamp = _stamp(value)
+    if not stamp:
+        match = re.fullmatch(r'(\d{1,3})\s+(day|week|hour|minute)s?\s+ago', value, re.I)
+        if match:
+            stamp = as_of - timedelta(**{match[2].casefold() + 's': int(match[1])})
+        else:
+            match = re.fullmatch(r'([a-z]+)\.?\s+(\d{1,2}),?\s+(20\d{2})', value, re.I)
+            try:
+                if match and (month := _ENGLISH_MONTH.get(match[1].casefold())):
+                    stamp = datetime(int(match[3]), month, int(match[2]), tzinfo=timezone.utc)
+                elif ',' in value:
+                    stamp = parsedate_to_datetime(value)
+            except (ValueError, TypeError, OverflowError):
+                return ''
+    return stamp.date().isoformat() if stamp else ''
+
+
 def _current_fact(item, as_of):
     published = item.get('published_at') or ''
     if not market_publication_possible(published, as_of):
@@ -617,7 +655,7 @@ def _percentage_change(local, position, suffix, metric_context):
     if MARKET_SHARE.search(local) or re.match(r'\s*(?:рынка\b|пункт\w*\b|от\s+)', suffix, re.I):
         return False
     prefix = local[:position]
-    if not re.search(r'(?:\b(?:на|составил\w*|достиг\w*)|[+:])\s*$', prefix, re.I):
+    if not re.search(r'(?:\b(?:на|составил\w*|достиг\w*|by|up|grew|rose|increased)|[+:])\s*$', prefix, re.I):
         return False
     return bool(GROWTH.search(metric_context))
 
@@ -679,6 +717,7 @@ def extract_observations(product, text, country='', published_at='', metadata=No
         if item:
             output.append(item)
     previous, previous_sentence = [], ''
+    report_period = ''
     for sentence, original_sentence in _market_fact_spans(text):
         ellipsis = COUNTRY_ELLIPSIS.fullmatch(sentence)
         if ellipsis and original_sentence == previous_sentence and len(previous) == 1:
@@ -694,23 +733,41 @@ def extract_observations(product, text, country='', published_at='', metadata=No
                                    'excerpt': original_sentence[:1000]})
             continue
         previous, previous_sentence = [], original_sentence
+        inherited_report_period, report_period = report_period, ''
+        if SIGNAL.search(sentence) and GROWTH.search(sentence) and not _sentence_products(sentence):
+            report_period = period_from(sentence)
         if not usable_market_excerpt(sentence) or not _has_product(product, sentence) or not current_market_fact(sentence) or _comparison_baseline(sentence):
             continue
-        period = period_from(sentence) or period_from(original_sentence) or period_from(text)
+        period = period_from(sentence) or (period_from(original_sentence) if not FORECAST.search(original_sentence) else '')
+        if not period and (stamp := _stamp(published_at)):
+            for month, pattern in enumerate(MONTHS, 1):
+                if re.search(r'\bв\s+' + pattern + r'\w*\b', sentence, re.I):
+                    period = f'{stamp.year - (month > stamp.month)}-{month:02d}'
+                    break
         actual_country = _market_country(sentence, text)
+        years = list(_EXPLICIT_YEAR.finditer(sentence))
         sentence_measures = []
         date_spans = [match.span() for match in re.finditer(r'(?<!\d)20\d{2}-(?:0[1-9]|1[0-2])(?:-\d{2})?(?!\d)', sentence)]
         date_spans.extend(match.span() for match in YEAR_RANGE.finditer(sentence))
+        trailing_years = len(years) > 1 and any(
+            SCALE_UNIT.match(sentence[amount.end():])['unit']
+            for amount in NUMBER.finditer(sentence, 0, years[0].start()))
         for match in NUMBER.finditer(sentence):
             if any(start <= match.start() and match.end() <= end for start, end in date_spans):
                 continue
             if re.fullmatch(r'20\d{2}', match[0]) and (re.match(r'\s*г(?:од|\.)', sentence[match.end():], re.I)
-                    or re.search(r'(?:\bв|\bза|итог\w*)\s*$', sentence[:match.start()], re.I)):
+                    or any(year.start(1) == match.start() for year in years)):
                 continue
             local, offset = _number_context(sentence, match)
             if _comparison_baseline(local) or not _number_belongs(product, sentence, match, offset, len(local)):
                 continue
             actual_period = period_from(local) or period
+            if len(years) > 1:
+                if trailing_years:
+                    year = next((year for year in years if year.start() >= match.end()), None)
+                else:
+                    year = next((year for year in reversed(years) if year.end() <= match.start()), None)
+                actual_period = year[1] if year else ''
             suffix = SCALE_UNIT.match(sentence[match.end():])
             scale, raw_unit = suffix.group('scale') or '', (suffix.group('unit') or '').casefold()
             prefix_currency = re.search(r'([$€])\s*$', sentence[:match.start()])
@@ -778,7 +835,7 @@ def extract_observations(product, text, country='', published_at='', metadata=No
         if actual_country:
             output.extend(sentence_measures)
             if not sentence_measures and (excerpt := _reported_product_excerpt(product, sentence, text)):
-                output.append(dict(metric='public_signal', value=None, unit='', period=period,
+                output.append(dict(metric='public_signal', value=None, unit='', period=period or inherited_report_period,
                     country=actual_country, published_at=published_at, excerpt=excerpt[:1000], measured=False))
     unique = {}
     for item in output:
@@ -849,11 +906,22 @@ def _validated_excerpt(item, as_of):
     return ''
 
 
-def _accepted_facts(store, countries, as_of):
+def _accepted_facts(store, countries, as_of, product_id=None):
     """One source-of-truth selection for ranking and its source preview."""
     if not countries:
         return []
     placeholders = ','.join('?' for _ in countries)
+    products = store.query('SELECT id,name FROM products ORDER BY id')
+    params = tuple(countries)
+    selected_ids = ''
+    if product_id is not None:
+        product = next((row for row in products if row['id'] == product_id), None)
+        if not product:
+            return []
+        kind = normalize_product(product['name'])
+        ids = [row['id'] for row in products if normalize_product(row['name']) == kind]
+        selected_ids = ' AND {alias}.product_id IN (' + ','.join('?' for _ in ids) + ')'
+        params += tuple(ids)
     observations = store.query('''SELECT o.id AS observation_id,o.product_id,o.metric,o.value,o.unit,
         o.period,o.country,o.measured,o.event_key,o.created_at,p.name,
         COALESCE(l.source_id,o.source_id) AS source_id,
@@ -863,8 +931,8 @@ def _accepted_facts(store, countries, as_of):
         FROM market_observations o JOIN products p ON p.id=o.product_id
         LEFT JOIN market_observation_sources l ON l.observation_id=o.id
         JOIN sources s ON s.id=COALESCE(l.source_id,o.source_id)
-        WHERE o.country IN (''' + placeholders + ''')
-        ORDER BY o.published_at DESC,o.created_at DESC,o.id DESC''', tuple(countries))
+        WHERE o.country IN (''' + placeholders + ')' + selected_ids.format(alias='o') + '''
+        ORDER BY o.published_at DESC,o.created_at DESC,o.id DESC''', params)
     output = []
     for item in observations:
         excerpt = _validated_excerpt(item, as_of)
@@ -876,11 +944,11 @@ def _accepted_facts(store, countries, as_of):
         s.url,s.title,s.text,s.published_at,s.fetched_at,ms.description
         FROM market_signals ms JOIN products p ON p.id=ms.product_id
         JOIN sources s ON s.id=ms.source_id
-        WHERE ms.country IN (''' + placeholders + ''')
+        WHERE ms.country IN (''' + placeholders + ')' + selected_ids.format(alias='ms') + '''
         AND NOT EXISTS(SELECT 1 FROM market_observations o
             LEFT JOIN market_observation_sources l ON l.observation_id=o.id
             WHERE o.product_id=ms.product_id AND (o.source_id=ms.source_id OR l.source_id=ms.source_id))
-        ORDER BY ms.created_at DESC,ms.id DESC''', tuple(countries))
+        ORDER BY ms.created_at DESC,ms.id DESC''', params)
     for source in legacy:
         text = source['text'] or source['description'] or source['title'] or ''
         for extracted in _parsed_market_text(source['name'], text, source['country'], source['published_at']):
@@ -897,7 +965,7 @@ def _accepted_facts(store, countries, as_of):
     # Aggregate old model-specific observations into the product kind without
     # changing or splitting any existing workspace.
     product_ids = {}
-    for row in store.query('SELECT id,name FROM products ORDER BY id'):
+    for row in products:
         try:
             kind = normalize_product(row['name'])
         except ValueError:
@@ -938,7 +1006,7 @@ def market_evidence(store, product_id, countries, as_of=None):
     """Only sources backing accepted facts for this product, geography and window."""
     as_of = as_of or datetime.now(timezone.utc)
     sources = {}
-    for item in _accepted_facts(store, countries, as_of):
+    for item in _accepted_facts(store, countries, as_of, product_id):
         if item['product_id'] != product_id:
             continue
         source = sources.setdefault(item['url'], {key: item[key] for key in

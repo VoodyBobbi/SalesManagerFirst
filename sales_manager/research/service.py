@@ -11,7 +11,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from .extraction import (domain_of, emails_in, is_directory, is_marketplace, legal_id_roles,
                          marketplace_seller_hint, parse_page, phone_normalize, external_links, sitemap_links)
-from .normalization import (CATEGORIES, COUNTRIES, buyer_segments, clean_text, branch_identity,
+from .normalization import (CATEGORIES, COUNTRIES, buyer_segments, clean_text,
                             company_identity, company_identity_key, matches_product, normalize_product,
                             organization_key, product_candidates)
 from sales_manager.core.contacts import email_purpose
@@ -19,12 +19,13 @@ from .providers import (ExaProvider, FirecrawlProvider, GDELTProvider, OverpassP
                         ProviderError, QuotaError, SearchResult, TransientProviderError, WikidataProvider, json_http,
                         TavilyProvider, SerperProvider, JinaProvider, MediaWikiProvider, RSSProvider,
                         KEYED_PROVIDERS, NoSourcesError, MissingKeyError, PublicPagesProvider,
-                        ComtradeProvider, OVERPASS_HOSTS, RateLimitError)
-from .safe_http import FetchError, SafeFetcher, validate_url
+                        ComtradeProvider, OVERPASS_HOSTS, RateLimitError, overpass_elements)
+from .safe_http import FetchError, SafeFetcher, TransientFetchError, validate_url
 from .quota import fetch_quota
 from .registry import ADAPTERS, market_source_names
 from .reporting import market_summary
 from .access import credential_hash, verify_free_access, free_access_valid
+from .market import SIGNAL, normalize_search_date
 from .market import (article_text, extract_observations, market_publication_possible,
                      market_ranking, measurement_basis, current_market_fact, market_fact_clause, SENTENCE_BOUNDARY)
 from sales_manager.core.company_listing import visible_companies
@@ -71,6 +72,7 @@ class ResearchService:
         self._limit = 100
         self._provider_clock = {}
         self._provider_locks = {}
+        self._overpass_retry_at = {}
         self._force_refresh = False
         self._responded = set()
         self._unavailable = set()
@@ -159,17 +161,19 @@ class ResearchService:
     def _json(self, method, url, **kwargs):
         # Secrets are excluded from cache keys and audit events.
         auth = hashlib.sha256(json.dumps(kwargs.get('headers', {}), sort_keys=True).encode()).hexdigest()
-        scoped_run = getattr(self, '_active_run_id', None) if urlsplit(url).hostname in ('api.tavily.com', 'api.exa.ai', 'google.serper.dev', 's.jina.ai', 'api.firecrawl.dev') else None
-        key = _key('provider:v3:', [method, url, kwargs.get('json'), kwargs.get('params'), kwargs.get('data'), auth, scoped_run])
+        host = urlsplit(url).hostname
+        overpass = host in OVERPASS_HOSTS
+        scoped_run = getattr(self, '_active_run_id', None) if host in ('api.tavily.com', 'api.exa.ai', 'google.serper.dev', 's.jina.ai', 'api.firecrawl.dev') else None
+        key = _key('overpass:v1:' if overpass else 'provider:v3:',
+                   [method, url, kwargs.get('json'), kwargs.get('params'), kwargs.get('data'), auth, scoped_run])
         cached = None if self._force_refresh else self._cache(key)
         if cached is not None:
             return cached
         self._checkpoint()
-        host = urlsplit(url).hostname
-        interval = 2.0 if host in OVERPASS_HOSTS else {'api.firecrawl.dev': 6.1,
+        interval = 2.0 if overpass else {'api.firecrawl.dev': 6.1,
                     'api.gdeltproject.org': 5.1, 'www.wikidata.org': 1.0,
                     'comtradeapi.un.org': 1.1}.get(host, .3)
-        provider = 'overpass' if host in OVERPASS_HOSTS else {
+        provider = 'overpass' if overpass else {
                     'api.exa.ai': 'exa', 'api.firecrawl.dev': 'firecrawl', 'api.tavily.com': 'tavily',
                     'google.serper.dev': 'serper', 's.jina.ai': 'jina',
                     'api.gdeltproject.org': 'gdelt', 'www.wikidata.org': 'wikidata',
@@ -192,6 +196,8 @@ class ResearchService:
             if self._cancel.wait(wait):
                 raise Paused('Исследование приостановлено.')
         result = json_http(method, url, **kwargs)
+        if overpass:
+            overpass_elements(result)
         self._put_cache(key, result)
         credits = (result.get('costDollars') or {}).get('total', 0)
         if not isinstance(credits, (int, float)):
@@ -218,6 +224,8 @@ class ResearchService:
                 urls = self.store.get_setting('search.' + name + '_urls', [])
                 if urls:
                     providers[name] = factory(name, urls, self._page)
+            elif name == 'overpass':
+                providers[name] = factory(self._json, retry_at=self._overpass_retry_at)
             else:
                 providers[name] = factory(self._json)
         return providers
@@ -504,7 +512,7 @@ class ResearchService:
         tasks = []
         eligible = {name: provider for name, provider in providers.items() if name in market_source_names()}
         if 'rss' in eligible:
-            tasks.append({'phase': 'search', 'provider': 'rss', 'query': '*:market-v2',
+            tasks.append({'phase': 'search', 'provider': 'rss', 'query': '*:market-v3',
                           'country': countries[0], 'market': True, 'discover': True})
         for country in countries:
             if 'procurement' in eligible:
@@ -549,19 +557,24 @@ class ResearchService:
         else:
             if not any(name != 'comtrade' for name in providers) and not self._saved_run('companies', product_id, countries):
                 raise self.no_sources_error('companies')
-            route = self._web_route(providers)
-            for country in countries:
-                for provider in ('overpass', 'wikidata', 'mediawiki', 'rss', 'catalog', 'procurement'):
-                    if provider in providers:
-                        tasks.append({'phase': 'search', 'provider': provider, 'query': product_name, 'country': country})
-                for segment in buyer_segments(product_name):
-                    for provider in route:
-                        tasks.append({'phase': 'search', 'provider': provider,
-                                      'query': f'{product_name} {segment} официальный сайт контакты {country}', 'country': country})
-                if 'gdelt' in providers:
-                    tasks.append({'phase': 'search', 'provider': 'gdelt', 'query': f'{product_name} компании {country}', 'country': country})
+            tasks = self._company_tasks(product_name, countries, providers)
         kind = 'manual:' + _key('', manual_url)[:12] if manual_url else 'companies'
         return self._run(kind, product_id, countries, tasks, providers, emit, cancel)
+
+    def _company_tasks(self, product_name, countries, providers):
+        tasks = []
+        route = self._web_route(providers)
+        for country in countries:
+            for provider in ('overpass', 'wikidata', 'mediawiki', 'rss', 'catalog', 'procurement'):
+                if provider in providers:
+                    tasks.append({'phase': 'search', 'provider': provider, 'query': product_name, 'country': country})
+            for segment in buyer_segments(product_name):
+                for provider in route:
+                    tasks.append({'phase': 'search', 'provider': provider,
+                                  'query': f'{product_name} {segment} официальный сайт контакты {country}', 'country': country})
+            if 'gdelt' in providers:
+                tasks.append({'phase': 'search', 'provider': 'gdelt', 'query': f'{product_name} компании {country}', 'country': country})
+        return tasks
 
     def _saved_run(self, kind, product_id, countries):
         return self.store.one("SELECT id FROM job_runs WHERE kind=? AND product_id IS ? AND countries=? AND status IN ('paused','interrupted','failed','running','complete_partial') AND (status!='complete_partial' OR EXISTS(SELECT 1 FROM job_queue q WHERE q.run_id=job_runs.id AND q.status!='done')) ORDER BY id DESC LIMIT 1",
@@ -574,19 +587,24 @@ class ResearchService:
         if not run:
             raise ValueError('Сохранённое исследование не найдено или уже завершено.')
         self._refresh_access(cancel)
-        return self._run(run['kind'], product_id, countries, [], self._providers(), emit, cancel, run_id=run_id)
+        providers = self._providers()
+        product = self.store.one('SELECT name FROM products WHERE id=?', (product_id,))
+        tasks = self._company_tasks(product['name'], countries, providers) if run['kind'] == 'companies' else []
+        return self._run(run['kind'], product_id, countries, tasks, providers, emit, cancel, run_id=run_id)
 
     def _market_followups(self, run_id, countries, providers, blocked):
         """One bounded, evidence-driven sweep of underrepresented categories."""
         marker = 'research.followups.' + str(run_id)
-        if self.store.get_setting(marker, False):
-            return False
+        planned = self.store.get_setting(marker, [])
+        if not isinstance(planned, list):
+            planned = [row['provider'] for row in self.store.query(
+                "SELECT DISTINCT json_extract(payload,'$.provider') AS provider FROM job_queue "
+                "WHERE run_id=? AND json_extract(payload,'$.followup')=1", (run_id,))]
         rows = market_ranking(self.store, countries, limit=10)['rows']
         if len(rows) >= 10:
-            self.store.set_setting(marker, True)
             return False
         represented = {normalize_product(row['name']) for row in rows}
-        sources = [name for name in providers if name not in blocked
+        sources = [name for name in providers if name not in blocked and name not in planned
                    and name in self._web_route(providers) + ['gdelt']]
         added = False
         for category, goods in CATEGORIES.items():
@@ -617,7 +635,8 @@ class ResearchService:
                     added = True
         # Commit marker after enqueueing. A crash before it is harmless because
         # the durable task identity prevents duplicates.
-        self.store.set_setting(marker, True)
+        if sources:
+            self.store.set_setting(marker, planned + sources)
         return added
 
     def _run(self, kind, product_id, countries, tasks, providers, emit, cancel, run_id=None):
@@ -638,7 +657,15 @@ class ResearchService:
                     raise ValueError('Сохранённое исследование не найдено или уже завершено.')
             else:
                 existing = self._saved_run(kind, product_id, countries)
-            run_id = existing['id'] if existing else self.store.execute('INSERT INTO job_runs(kind,product_id,status,countries,created_at,updated_at) VALUES(?,?,?,?,?,?)', (kind, product_id, 'running', signature, now(), now()))
+            if existing:
+                run_id = existing['id']
+            else:
+                with self.store.db as db:
+                    run_id = db.execute('INSERT INTO job_runs(kind,product_id,status,countries,created_at,updated_at) VALUES(?,?,?,?,?,?)',
+                                        (kind, product_id, 'running', signature, now(), now())).lastrowid
+                    if kind.startswith('manual:'):
+                        for task in tasks:
+                            self._enqueue(run_id, task, connection=db)
             self._active_run_id = run_id
             self._active_kind = kind
             self._responded.update(row['provider'] for row in self.store.query(
@@ -742,6 +769,7 @@ class ResearchService:
                                            (type(exc).__name__ + ': не удалось обработать элемент поиска', todo['id']))
                         emit('Не удалось обработать один результат. Продолжаем поиск.')
                     else:
+                        payload.pop('retry_on_resume', None)
                         self.store.execute("UPDATE job_queue SET status='done',payload=?,error=? WHERE id=?",
                             (json.dumps(payload, ensure_ascii=False), 'Часть RSS-лент недоступна' if payload.get('partial') else '', todo['id']))
             except Paused as exc:
@@ -761,8 +789,6 @@ class ResearchService:
             total = len(market_source_names()) if kind == 'market' else sum('companies' in spec.capabilities for spec in ADAPTERS.values())
             message = (f'Поиск завершён. {"Доступные источники исчерпаны. " if reason == "sources_exhausted" else ""}Найдено {noun}: {count}. Использовано источников: {len(self._responded)}/{total}.'
                        if status == 'complete' else 'Работа прервана. Незавершённое исследование сохранено для восстановления.')
-            self.store.execute('UPDATE job_runs SET status=?,reason=?,message=?,updated_at=? WHERE id=?',
-                               (status, reason, message, now(), run_id))
             response = {'run_id': run_id, 'status': status, 'count': count, 'requests': self._requests,
                         'reason': reason, 'successful_sources': sorted(self._responded),
                         'unavailable_sources': sorted(self._unavailable), 'message': message,
@@ -770,8 +796,8 @@ class ResearchService:
                         'billing_blocked_sources': self.billing_blocked_sources()}
             if kind == 'market':
                 response.update(market_summary(self.store, run_id, countries, status, count=count))
-                self.store.execute('UPDATE job_runs SET status=?,message=? WHERE id=?',
-                                   (response['status'], response['message'], run_id))
+            self.store.execute('UPDATE job_runs SET status=?,reason=?,message=?,updated_at=? WHERE id=?',
+                               (response['status'], reason, response['message'], now(), run_id))
             return response
         finally:
             self._active_run_id = None
@@ -784,7 +810,7 @@ class ResearchService:
             self.store.execute('INSERT OR IGNORE INTO job_source_responses(run_id,provider,first_success_at) VALUES(?,?,?)',
                                (run_id, name, now()))
 
-    def _enqueue(self, run_id, payload):
+    def _enqueue(self, run_id, payload, *, connection=None):
         phase = payload['phase']
         existing = self.store.one(
                 "SELECT id,status,error FROM job_queue WHERE run_id=? AND json_extract(payload,'$.phase')='search' "
@@ -803,8 +829,9 @@ class ResearchService:
             result = payload['result']
             identity = [result['url'], '' if result.get('metadata', {}).get('provider') == 'gdelt' else result.get('country', '')]
         task_key = phase + ':' + _key('', identity)
-        self.store.execute('INSERT OR IGNORE INTO job_queue(run_id,task_key,payload,status) VALUES(?,?,?,?)',
-                           (run_id, task_key, json.dumps(payload, ensure_ascii=False), 'pending'))
+        execute = connection.execute if connection is not None else self.store.execute
+        execute('INSERT OR IGNORE INTO job_queue(run_id,task_key,payload,status) VALUES(?,?,?,?)',
+                (run_id, task_key, json.dumps(payload, ensure_ascii=False), 'pending'))
 
     def _handle(self, run_id, product_id, task, providers, emit, blocked=None):
         if task['phase'] == 'search':
@@ -866,7 +893,7 @@ class ResearchService:
                 emit(f'{task["country"]}: запрос к {task["provider"]}…')
                 if task.get('discover') and task['provider'] == 'rss':
                     try:
-                        results = provider.discover(task['country'], limit=1000)
+                        results = provider.discover(task['country'], limit=None)
                     except ProviderError as exc:
                         self._record_status('rss', exc)
                         self._unavailable.add('rss')
@@ -878,21 +905,16 @@ class ResearchService:
                     if task['partial']:
                         self._unavailable.add('rss:partial')
                         emit(f'RSS: недоступно лент — {len(provider.last_errors)}. Продолжаем по остальным.')
-                    # Prefer actual demand reports; articles can identify goods in their body.
-                    results = [r for r in results if self._market_candidate(r)]
-                    results.sort(key=lambda r: (
-                        bool(product_candidates(r.title + ' ' + r.snippet)) * 2 +
-                        bool(re.search(r'спрос|продаж|закуп|заказ|покуп|просмотр|интерес', r.title + ' ' + r.snippet, re.I)) * 8 +
-                        bool(re.search(r'вырос|увелич|приобрели|продано', r.title + ' ' + r.snippet, re.I))), reverse=True)
-                    groups = {}
+                    # Give likely reports the first slots while keeping every eligible article.
+                    date = datetime.now(timezone.utc)
+                    results = [r for r in results if market_publication_possible(normalize_search_date(r.published_at, date), date)]
+                    results.sort(key=lambda r: bool(SIGNAL.search(r.title + ' ' + r.snippet)), reverse=True)
                     for result in results:
-                        group = tuple(product_candidates(result.title + ' ' + result.snippet)) or ('other',)
-                        groups.setdefault(group, []).append(result)
-                    from itertools import zip_longest
-                    results = [item for batch in zip_longest(*groups.values()) for item in batch if item is not None][:300]
+                        result.metadata.setdefault('provider', 'rss')
                 else:
                     results = self._search(task['provider'], provider, task['query'], task['country'], limit=10)
             for result in results:
+                self._check_cancelled()
                 if not result.url.startswith(('https://', 'http://')):
                     continue
                 if task.get('market'):
@@ -959,7 +981,7 @@ class ResearchService:
 
     def _document(self, url, source='rss'):
         url = validate_url(url)
-        key = _key('document:v1:', url)
+        key = _key('document:v2:', url)
         cached = None if self._force_refresh else self._cache(key)
         if cached is not None:
             if cached.get('error'):
@@ -972,7 +994,8 @@ class ResearchService:
         try:
             raw = self.fetcher.fetch_document(url)
         except FetchError as exc:
-            self._put_cache(key, {'error': str(exc)}, ttl=1800)
+            if not isinstance(exc, TransientFetchError):
+                self._put_cache(key, {'error': str(exc)}, ttl=1800)
             raise
         value = {'url': raw.url, 'text': raw.text}
         self._put_cache(key, value, ttl=1800)
@@ -980,7 +1003,7 @@ class ResearchService:
 
     def _page(self, url, country):
         url = validate_url(url)
-        key = _key('page:v9:', [url, country])
+        key = _key('page:v11:', [url, country])
         cached = None if self._force_refresh else self._cache(key)
         if cached is not None:
             if cached.get('error'):
@@ -995,7 +1018,8 @@ class ResearchService:
             page['external_links'] = external_links(raw.text, raw.url)
             page['source_id'] = self.store.put_source(raw.url, page['title'], page['text'])
         except FetchError as exc:
-            self._put_cache(key, {'error': str(exc)}, ttl=3600)
+            if not isinstance(exc, TransientFetchError):
+                self._put_cache(key, {'error': str(exc)}, ttl=3600)
             raise
         self._put_cache(key, page, ttl=86400)
         return page
@@ -1005,13 +1029,18 @@ class ResearchService:
         source_id = None
         if not self._market_candidate(result):
             return
+        as_of = datetime.now(timezone.utc)
+        published_at = normalize_search_date(result.published_at, as_of)
         if not result.metadata.get('official_statistics'):
             try:
                 page = self._page(result.url, result.country)
+                published_at = normalize_search_date(page.get('published_at'), as_of) or published_at
+                if not market_publication_possible(published_at, as_of):
+                    return
                 text = result.title + '. ' + (page.get('market_text') or result.snippet)
                 # Market validation must use the same article-only evidence as
                 # extraction. Site menus mention unrelated countries/products.
-                source_id = self.store.put_source(page.get('url', result.url), result.title, text, result.published_at)
+                source_id = self.store.put_source(page.get('url', result.url), result.title, text, published_at)
             except FetchError:
                 pass
         candidates = product_candidates(text)
@@ -1021,7 +1050,7 @@ class ResearchService:
         if not candidates:
             return
         for product in candidates:
-            observations = extract_observations(product, text, result.country, result.published_at, result.metadata,
+            observations = extract_observations(product, text, result.country, published_at, result.metadata,
                                                 title=result.title)
             selected = result.metadata.get('selected_countries')
             if selected:
@@ -1029,17 +1058,11 @@ class ResearchService:
             if not observations:
                 continue
             if not source_id:
-                source_id = self.store.put_source(result.url, result.title, text[:100000], result.published_at)
-            elif result.published_at:
-                self.store.execute("UPDATE sources SET published_at=? WHERE id=? AND published_at=''", (result.published_at, source_id))
+                source_id = self.store.put_source(result.url, result.title, text[:100000], published_at)
+            elif published_at:
+                self.store.execute("UPDATE sources SET published_at=? WHERE id=? AND published_at=''", (published_at, source_id))
             normalized = normalize_product(product)
-            existing = self.store.one('SELECT * FROM products WHERE normalized=?', (normalized,))
-            # Old versions could use the generic identity for a model-specific
-            # workspace. Preserve that workspace and create a separate market
-            # product instead of silently repurposing or splitting it.
-            if existing and branch_identity(existing['name']) != normalized:
-                normalized = 'market:' + normalized
-            row = self.store.ensure_product(product, normalized=normalized)
+            row = self.store.ensure_generic_product(product, normalized)
             for item in observations:
                 self.store.execute('''INSERT OR IGNORE INTO market_observations
                     (product_id,source_id,metric,value,unit,period,country,published_at,excerpt,measured,event_key,created_at)
@@ -1060,11 +1083,12 @@ class ResearchService:
 
     @staticmethod
     def _market_candidate(result):
-        if not market_publication_possible(result.published_at, datetime.now(timezone.utc)):
+        as_of = datetime.now(timezone.utc)
+        if not market_publication_possible(normalize_search_date(result.published_at, as_of), as_of):
             return False
         summary = result.title + ' ' + result.snippet
-        return bool(result.metadata.get('official_statistics') or product_candidates(summary) or
-                    re.search(r'спрос|продаж|закуп|заказ|покуп|потреблен', summary, re.I))
+        return bool(result.metadata.get('official_statistics') or result.metadata.get('provider') == 'rss'
+                    or product_candidates(summary) or SIGNAL.search(summary))
 
     def market_ranking(self, countries, limit=10):
         return market_ranking(self.store, countries, limit)
@@ -1132,7 +1156,7 @@ class ResearchService:
                 pages.append(first)
                 official_url = first['url']
                 page_limit = max(1, min(int(self.store.get_setting('search.page_limit', 8)), 20))
-                todo = first['links']
+                todo = [url for url in first['links'] if domain_of(url) == site_domain]
                 root = urlsplit(first['url'])
                 root_url = urlunsplit((root.scheme, root.netloc, '/', '', ''))
                 if root_url != first['url']:
@@ -1148,7 +1172,7 @@ class ResearchService:
                 for url in todo:
                     if len(pages) >= page_limit:
                         break
-                    if url in seen:
+                    if url in seen or domain_of(url) != site_domain:
                         continue
                     seen.add(url)
                     try:
@@ -1171,12 +1195,19 @@ class ResearchService:
             if branch_address:
                 name = (name + ' — ' + branch_address)[:180]
         from .fit_rules import evaluate_fit
-        decision = evaluate_fit(product['name'], pages, meta, result.country)
+        evidence_pages = []
+        for page in pages:
+            text = page.get('organization_text', page['text'])
+            if text != page['text']:
+                source_id = self.store.put_source(page['url'], page['title'], text)
+                page = dict(page, text=text, source_id=source_id)
+            evidence_pages.append(page)
+        decision = evaluate_fit(product['name'], evidence_pages, meta, result.country)
         status, reason = decision['status'], decision['reason']
         profile = decision['profile']
         potential = int(decision['potential'])
         country = profile['country'] or result.country
-        for page in pages:
+        for page in evidence_pages:
             sid = page['source_id']
             source_ids.append(sid)
             contacts.extend(('email', value, sid) for value in page['emails'])
@@ -1218,7 +1249,7 @@ class ResearchService:
                                         external_legal_ids=external_legal_ids, rejected_redirect=rejected_redirect,
                                         branch_name=branch_name, address=address, region=region,
                                         org_key=org_key, identity=identity)
-        self._persist_fit(product_id, company_id, product, pages, meta, country, status, reason, potential,
+        self._persist_fit(product_id, company_id, product, evidence_pages, meta, country, status, reason, potential,
                           profile, source_ids, contacts, manual, errors, rejected_urls, name, emit)
         # Confirmed local branches keep separate cards, contacts and fit history.
         for branch_page in pages:
